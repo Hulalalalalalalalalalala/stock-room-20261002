@@ -305,5 +305,134 @@ class ReversalTests(unittest.TestCase):
         self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
 
 
+class MinimumStockTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_set_minimum_returns_object_and_persists(self):
+        self.assertEqual(self.app.set_minimum("  PAPER  ", 15), {"code": "PAPER", "minimum": 15})
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.set_minimum("BOX", 3), {"code": "BOX", "minimum": 3})
+        self.assertEqual(StockRoom(self.root).shortages()[0]["minimum"], 3)
+
+    def test_set_minimum_overwrites_and_zero_cancels(self):
+        self.app.set_minimum("PAPER", 15)
+        self.assertEqual(self.app.set_minimum("PAPER", 2)["minimum"], 2)
+        self.assertEqual([item["code"] for item in self.app.shortages()], [])
+        self.assertEqual(self.app.set_minimum("PAPER", 0)["minimum"], 0)
+        self.assertEqual(self.app.shortages(), [])
+
+    def test_invalid_minimum_rejected(self):
+        for minimum in (-1, True, False, 1.5, "15", None, [15]):
+            with self.subTest(minimum=minimum):
+                with self.assertRaises(ValueError):
+                    self.app.set_minimum("PAPER", minimum)
+        for code in ("", "   ", 11, None, "paper", "UNKNOWN"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.set_minimum(code, 15)
+
+    def test_failed_set_minimum_preserves_file_and_ledger(self):
+        self.app.set_minimum("PAPER", 15)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.set_minimum("PAPER", True)
+        with self.assertRaises(ValueError):
+            self.app.set_minimum("UNKNOWN", 1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_failed_set_minimum_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.set_minimum("PAPER", 1)
+        with self.assertRaises(ValueError):
+            app.set_minimum(11, 1)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_shortages_fixed_sample_survives_reopen_and_count(self):
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_minimum("BOX", 3)
+        expected = [
+            {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 0, "minimum": 3, "shortage": 3},
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 14, "minimum": 15, "shortage": 1},
+        ]
+        self.assertEqual(self.app.shortages(), expected)
+        self.app.count("PAPER", 11, "CNT-001")
+        self.assertEqual(self.app.shortages()[1], {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 11, "minimum": 15, "shortage": 4})
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.shortages()[1]["shortage"], 4)
+        reopened.set_minimum("BOX", 0)
+        self.assertEqual([item["code"] for item in StockRoom(self.root).shortages()], ["PAPER"])
+
+    def test_shortages_unset_minimum_treated_as_zero(self):
+        self.assertEqual(self.app.shortages(), [])
+
+    def test_shortages_empty_directory_returns_empty_without_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.shortages(), [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_shortages_sorted_by_unicode_code_points(self):
+        self.app.register("纸张", "A4纸", "张")
+        for code, minimum in (("PAPER", 15), ("BOX", 3), ("纸张", 1)):
+            self.app.set_minimum(code, minimum)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX", "PAPER", "纸张"])
+
+    def test_shortages_query_does_not_modify_file(self):
+        self.app.set_minimum("PAPER", 15)
+        before = self.app.path.read_bytes()
+        self.app.shortages()
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_shortages_reflect_later_movement_and_reversal(self):
+        self.app.set_minimum("PAPER", 15)
+        self.assertEqual(self.app.shortages()[0]["shortage"], 1)
+        self.app.movement("PAPER", 1, "IN-002")
+        self.assertEqual(self.app.shortages(), [])
+        self.app.movement("PAPER", -1, "OUT-002")
+        self.app.reverse("OUT-002", "REV-OUT")
+        self.assertEqual(self.app.shortages(), [])
+
+    def test_cli_set_minimum_and_shortages(self):
+        payload = self.root / "minimum.json"
+        payload.write_text(json.dumps({"code": "PAPER", "minimum": 15}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-minimum", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"code": "PAPER", "minimum": 15})
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "shortages"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["code"] for row in json.loads(result.stdout)], ["PAPER"])
+
+    def test_cli_set_minimum_array_keeps_earlier_success(self):
+        payload = self.root / "minimum-batch.json"
+        payload.write_text(json.dumps([
+            {"code": "PAPER", "minimum": 15},
+            {"code": "PAPER", "minimum": True},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-minimum", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual([row["code"] for row in self.app.shortages()], ["PAPER"])
+
+    def test_cli_set_minimum_invalid_argument_returns_2(self):
+        payload = self.root / "bad-minimum.json"
+        payload.write_text(json.dumps({"code": "PAPER", "minimum": -1}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-minimum", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

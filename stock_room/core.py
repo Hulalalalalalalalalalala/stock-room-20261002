@@ -98,6 +98,30 @@ class StockRoom(JsonStore):
             raise ValueError("unknown material")
         return [dict(row) for row in data.get("reversals", []) if row["code"] == code]
 
+    def set_minimum(self, code, minimum):
+        code = text(code, "code")
+        if type(minimum) is not int or minimum < 0:
+            raise ValueError("minimum must be a nonnegative integer")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        data.setdefault("minimums", {})[code] = minimum
+        self._write(data)
+        return {"code": code, "minimum": minimum}
+
+    def shortages(self):
+        data = self._read()
+        rows = data.get("movements", [])
+        minimums = data.get("minimums", {})
+        items = []
+        for code, material in data.get("materials", {}).items():
+            quantity = sum(row["quantity"] for row in rows if row["code"] == code)
+            minimum = minimums.get(code, 0)
+            if quantity < minimum:
+                items.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity, "minimum": minimum, "shortage": minimum - quantity})
+        items.sort(key=lambda item: item["code"])
+        return items
+
     @staticmethod
     def _require_unique_reference(data, reference):
         if any(row["reference"] == reference for row in data.get("movements", [])):
