@@ -11,6 +11,31 @@ class StockRoom(JsonStore):
         self._write(data)
         return materials[code]
 
+    def set_minimum(self, code, minimum):
+        code = text(code, "code")
+        if type(minimum) is not int or minimum < 0:
+            raise ValueError("minimum must be a nonnegative integer")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        data.setdefault("minimums", {})[code] = minimum
+        self._write(data)
+        return {"code": code, "minimum": minimum}
+
+    def shortages(self):
+        data = self._read()
+        materials = data.get("materials", {})
+        minimums = data.get("minimums", {})
+        rows = data.get("movements", [])
+        result = []
+        for code in sorted(materials):
+            material = materials[code]
+            quantity = sum(row["quantity"] for row in rows if row["code"] == code)
+            minimum = minimums.get(code, 0)
+            if quantity < minimum:
+                result.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity, "minimum": minimum, "shortage": minimum - quantity})
+        return result
+
     def movement(self, code, quantity, reference):
         reference = text(reference, "reference")
         if type(quantity) is not int or quantity == 0:

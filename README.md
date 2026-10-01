@@ -31,10 +31,14 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `counts` → `StockRoom.counts(code)`，按登记顺序返回该物料的盘点对象列表；已登记但无盘点记录的物料返回空列表。后续出入库不改变已保存的盘点数值。
 - `reverse` → `StockRoom.reverse(original_reference, reference)`，冲销一笔普通出入库流水。保留原流水，追加一条数量相反、编号为 `reference` 的流水，并返回 `code`、`original_reference`、`reference`、`quantity`（冲销数量）与 `balance`（冲销完成时的库存）。冲销作用于当前库存，不回退其间的其他出入库或盘点，也不改写历史盘点数值。
 - `reversals` → `StockRoom.reversals(code)`，按登记顺序返回该物料的冲销对象列表，每项含上述五个字段，`balance` 保留登记时的值；已登记但无冲销的物料返回空列表。
+- `set-minimum` → `StockRoom.set_minimum(code, minimum)`，为已登记物料设置最低库存。`minimum` 必须是非负整数（不接受布尔、小数、字符串或其他类型）；返回含 `code` 与 `minimum` 的对象。再次设置覆盖原值，设为零即取消预警。设置不新增出入库流水、盘点、冲销或其他历史记录。
+- `shortages` → `StockRoom.shortages()`，无参数，可省略输入文件。返回缺料物料对象列表，仅包含当前库存严格小于最低库存的已登记物料；未设置最低库存的物料按零处理，旧数据目录无需补写配置。每项含 `code`、`name`、`unit`、`quantity`（当前台账库存）、`minimum` 与 `shortage`（`minimum` 减 `quantity`），按 `code` 逐字符比较 Unicode 码点升序排列；没有缺料或尚未登记物料时返回空列表。查询不改写文件，也不为尚无数据的目录创建文件。
 
 `code` 与盘点 `reference` 只接受去除首尾空白后的非空字符串，编码区分大小写；`counted` 必须是非负整数（不接受布尔、小数或其他类型），否则抛出 `ValueError`。盘点编号与全部物料的出入库编号共用唯一范围，重复编号抛出 `ValueError`；普通出入库也不能复用零差异盘点占用的编号。校验失败时 `data.json`、库存及两类历史均保持不变。
 
 冲销的 `original_reference` 与 `reference` 同样只接受去除首尾空白后的非空字符串并区分大小写。原编号不存在、指向盘点（含零差异盘点）或冲销记录、或该笔流水已被成功冲销，新编号与任一物料的流水或盘点编号重复，以及冲销后库存为负，均抛出 `ValueError`；查询未知物料的冲销列表也抛出 `ValueError`。每笔普通流水最多成功冲销一次。拒绝操作后 `data.json`、库存和全部历史保持不变，不新增编号占用。冲销关联保存在 `root/data.json` 中，重新打开同一目录仍可查询。
+
+最低库存设置的 `code` 同样去除首尾空白后匹配并区分大小写。编码不是非空字符串、物料不存在或 `minimum` 非法，均抛出 `ValueError`；拒绝后 `data.json` 及全部业务查询结果保持不变，不占用流水编号。最低库存保存在 `root/data.json` 中，重新打开同一目录仍生效；后续出入库、盘点和冲销按最新库存影响缺料清单。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
