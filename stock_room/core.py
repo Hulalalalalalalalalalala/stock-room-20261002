@@ -56,6 +56,39 @@ class StockRoom(JsonStore):
         self._write(data)
         return dict(record)
 
+    def reverse(self, original_reference, reference):
+        original_reference = text(original_reference, "original_reference")
+        reference = text(reference, "reference")
+        data = self._read()
+        rows = data.setdefault("movements", [])
+        reversals = data.get("reversals", [])
+        if any(row["reference"] == original_reference for row in data.get("counts", [])):
+            raise ValueError("cannot reverse a count")
+        if any(row["reference"] == original_reference for row in reversals):
+            raise ValueError("cannot reverse a reversal")
+        if any(row["original_reference"] == original_reference for row in reversals):
+            raise ValueError("movement already reversed")
+        original = next((row for row in rows if row["reference"] == original_reference), None)
+        if original is None:
+            raise ValueError("original reference not found")
+        self._require_unique_reference(data, reference)
+        quantity = -original["quantity"]
+        balance = sum(row["quantity"] for row in rows if row["code"] == original["code"]) + quantity
+        if balance < 0:
+            raise ValueError("insufficient stock")
+        rows.append({"code": original["code"], "quantity": quantity, "reference": reference})
+        record = {"code": original["code"], "original_reference": original_reference, "reference": reference, "quantity": quantity, "balance": balance}
+        data.setdefault("reversals", []).append(record)
+        self._write(data)
+        return dict(record)
+
+    def reversals(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return [dict(row) for row in data.get("reversals", []) if row["code"] == code]
+
     def counts(self, code):
         code = text(code, "code")
         data = self._read()

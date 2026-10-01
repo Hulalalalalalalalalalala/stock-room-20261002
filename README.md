@@ -29,8 +29,10 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `history` → `StockRoom.history(...)`。参数名见 `core.py` 的公开方法签名。
 - `count` → `StockRoom.count(code, counted, reference)`，按单个物料登记盘点。`counted` 为实点数量（非负整数）；返回 `code`、`reference`、`before`（盘点时库存）、`counted`、`difference`（实点减原库存），库存随后等于 `counted`。差异非零时在出入库流水中追加一条同字段记录（`quantity` 为差异、`reference` 为盘点编号）；零差异只登记盘点、不追加流水。
 - `counts` → `StockRoom.counts(code)`，按登记顺序返回该物料的盘点对象列表；已登记但无盘点记录的物料返回空列表。后续出入库不改变已保存的盘点数值。
+- `reverse` → `StockRoom.reverse(original_reference, reference)`，冲销一笔普通出入库流水。保留原流水，追加一条 `quantity` 相反、编号为 `reference` 的流水，返回 `code`、`original_reference`、`reference`、`quantity` 和 `balance`（冲销完成后的当前库存）。冲销作用于当前库存，即使其间已有其他出入库或盘点也不回退这些操作，也不改写已保存的盘点数值。
+- `reversals` → `StockRoom.reversals(code)`，按登记顺序返回该物料的冲销对象列表；已登记但无冲销记录的物料返回空列表。每项包含 `reverse` 返回的五个字段，`balance` 保留登记时的值。
 
-`code` 与盘点 `reference` 只接受去除首尾空白后的非空字符串，编码区分大小写；`counted` 必须是非负整数（不接受布尔、小数或其他类型），否则抛出 `ValueError`。盘点编号与全部物料的出入库编号共用唯一范围，重复编号抛出 `ValueError`；普通出入库也不能复用零差异盘点占用的编号。校验失败时 `data.json`、库存及两类历史均保持不变。
+`code` 与各类 `reference` 只接受去除首尾空白后的非空字符串，编码区分大小写；`counted` 必须是非负整数（不接受布尔、小数或其他类型），否则抛出 `ValueError`。所有编号（出入库、盘点、冲销的新编号）共用唯一范围，重复编号抛出 `ValueError`；普通出入库也不能复用零差异盘点占用的编号。冲销时原编号不存在、指向盘点或冲销记录、该流水已被成功冲销，或冲销后库存为负，均抛出 `ValueError`；每笔普通流水最多成功冲销一次，零差异盘点不能被冲销。校验失败时 `data.json`、库存及全部历史保持不变，也不会占用新编号。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
