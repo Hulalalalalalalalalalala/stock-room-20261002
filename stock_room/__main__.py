@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import StockRoom
 
-ACTIONS = {'register': 'register', 'move': 'movement', 'stock': 'stock', 'history': 'history', 'count': 'count', 'counts': 'counts'}
+ACTIONS = {'register': 'register', 'move': 'movement', 'stock': 'stock', 'history': 'history', 'count': 'count', 'counts': 'counts', 'reverse': 'reverse', 'reversals': 'reversals'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

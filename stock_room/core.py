@@ -63,6 +63,41 @@ class StockRoom(JsonStore):
             raise ValueError("unknown material")
         return [dict(row) for row in data.get("counts", []) if row["code"] == code]
 
+    def reverse(self, original_reference, reference):
+        original_reference = text(original_reference, "original_reference")
+        reference = text(reference, "reference")
+        data = self._read()
+        counts = data.get("counts", [])
+        reversals = data.get("reversals", [])
+        if any(row["reference"] == original_reference for row in counts):
+            raise ValueError("cannot reverse a count")
+        if any(row["reference"] == original_reference for row in reversals):
+            raise ValueError("cannot reverse a reversal")
+        if any(row["original_reference"] == original_reference for row in reversals):
+            raise ValueError("movement already reversed")
+        original = next((row for row in data.get("movements", []) if row["reference"] == original_reference), None)
+        if original is None:
+            raise ValueError("unknown original reference")
+        code = original["code"]
+        quantity = -original["quantity"]
+        self._require_unique_reference(data, reference)
+        stock = sum(row["quantity"] for row in data["movements"] if row["code"] == code)
+        if stock + quantity < 0:
+            raise ValueError("insufficient stock")
+        balance = stock + quantity
+        data["movements"].append({"code": code, "quantity": quantity, "reference": reference})
+        record = {"code": code, "original_reference": original_reference, "reference": reference, "quantity": quantity, "balance": balance}
+        data.setdefault("reversals", []).append(record)
+        self._write(data)
+        return dict(record)
+
+    def reversals(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return [dict(row) for row in data.get("reversals", []) if row["code"] == code]
+
     @staticmethod
     def _require_unique_reference(data, reference):
         if any(row["reference"] == reference for row in data.get("movements", [])):

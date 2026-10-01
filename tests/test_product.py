@@ -183,5 +183,127 @@ class CountTests(unittest.TestCase):
         self.assertEqual(len(self.app.counts("PAPER")), 1)
         self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
 
+class ReversalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_reverse_issue_survives_reopen(self):
+        with self.assertRaises(ValueError):
+            self.app.reverse("IN-001", "REV-IN")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        record = self.app.reverse("OUT-001", "REV-OUT")
+        self.assertEqual(record, {"code": "PAPER", "original_reference": "OUT-001", "reference": "REV-OUT", "quantity": 6, "balance": 20})
+        reopened = StockRoom(self.root)
+        self.assertEqual([row["quantity"] for row in reopened.history("PAPER")], [20, -6, 6])
+        self.assertEqual(reopened.reversals("PAPER"), [record])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 20)
+
+    def test_reversals_empty_for_registered_material(self):
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_reversals_unknown_material_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.reversals("OTHER")
+
+    def test_reverse_identifiers_are_stripped_and_case_sensitive(self):
+        record = self.app.reverse("  OUT-001  ", "  REV-OUT  ")
+        self.assertEqual(record["original_reference"], "OUT-001")
+        self.assertEqual(record["reference"], "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.reverse("out-001", "REV-LOWER")
+
+    def test_reverse_invalid_identifiers_rejected(self):
+        for value in ("", "   ", 11, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.app.reverse(value, "REV-X")
+                with self.assertRaises(ValueError):
+                    self.app.reverse("OUT-001", value)
+
+    def test_reverse_rejects_missing_count_and_reversal_references(self):
+        self.app.count("PAPER", 11, "CNT-001")
+        with self.assertRaises(ValueError):
+            self.app.reverse("MISSING", "REV-1")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-001", "REV-2")
+        self.app.count("PAPER", 11, "CNT-ZERO")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-ZERO", "REV-3")
+        self.app.reverse("OUT-001", "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.reverse("REV-OUT", "REV-4")
+
+    def test_movement_reversed_at_most_once(self):
+        self.app.reverse("OUT-001", "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.reverse("OUT-001", "REV-AGAIN")
+        self.assertEqual(len(self.app.reversals("PAPER")), 1)
+
+    def test_reverse_reference_scope_is_shared(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        for reference in ("IN-001", "OUT-001", "CNT-ZERO"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.reverse("OUT-001", reference)
+        self.app.reverse("OUT-001", "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.movement("PAPER", 1, "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.count("PAPER", 20, "REV-OUT")
+
+    def test_reverse_acts_on_current_stock_without_rewriting_history(self):
+        self.app.count("PAPER", 11, "CNT-001")
+        self.app.movement("PAPER", 2, "IN-002")
+        record = self.app.reverse("OUT-001", "REV-OUT")
+        self.assertEqual(record["balance"], 19)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 19)
+        self.assertEqual([row["difference"] for row in self.app.counts("PAPER")], [-3])
+        self.assertEqual([row["quantity"] for row in self.app.history("PAPER")], [20, -6, -3, 2, 6])
+
+    def test_failed_reverse_preserves_file_and_histories(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse("IN-001", "REV-NEG")
+        with self.assertRaises(ValueError):
+            self.app.reverse("MISSING", "REV-MISS")
+        with self.assertRaises(ValueError):
+            self.app.reverse("OUT-001", "IN-001")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+
+    def test_cli_reverse_and_reversals(self):
+        payload = self.root / "reverse.json"
+        payload.write_text(json.dumps({"original_reference": "OUT-001", "reference": "REV-OUT"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual((value["quantity"], value["balance"]), (6, 20))
+        query = self.root / "query.json"
+        query.write_text(json.dumps({"code": "PAPER"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reversals", str(query)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["reference"] for row in json.loads(result.stdout)], ["REV-OUT"])
+
+    def test_cli_reverse_array_keeps_earlier_success(self):
+        payload = self.root / "reverse-batch.json"
+        payload.write_text(json.dumps([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "OUT-001", "reference": "REV-AGAIN"},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(len(self.app.reversals("PAPER")), 1)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
+
+
 if __name__ == "__main__":
     unittest.main()
