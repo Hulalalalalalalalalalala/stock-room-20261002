@@ -28,6 +28,42 @@ class StockRoom(JsonStore):
         self._write(data)
         return {**row, "balance": stock + quantity}
 
+    def movement_batch(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty array")
+        data = self._read()
+        materials = data.get("materials", {})
+        history = data.get("movements", [])
+        allowed = {"code", "quantity", "reference"}
+        seen = set()
+        stocks = {}
+        pending = []
+        results = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != allowed:
+                raise ValueError("each row must be an object with code, quantity and reference")
+            code = text(row["code"], "code")
+            reference = text(row["reference"], "reference")
+            if code not in materials:
+                raise ValueError("unknown material")
+            quantity = row["quantity"]
+            if type(quantity) is not int or quantity == 0:
+                raise ValueError("quantity must be a nonzero integer")
+            if reference in seen:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            seen.add(reference)
+            if code not in stocks:
+                stocks[code] = sum(item["quantity"] for item in history if item["code"] == code)
+            stocks[code] += quantity
+            if stocks[code] < 0:
+                raise ValueError("insufficient stock")
+            pending.append({"code": code, "quantity": quantity, "reference": reference})
+            results.append({"code": code, "quantity": quantity, "reference": reference, "balance": stocks[code]})
+        data.setdefault("movements", []).extend(pending)
+        self._write(data)
+        return results
+
     def stock(self, code):
         data = self._read()
         if code not in data.get("materials", {}):
