@@ -1,0 +1,12 @@
+[
+  {
+    "code": "PAPER",
+    "name": "包装纸",
+    "unit": "张"
+  },
+  {
+    "code": "BOX",
+    "name": "纸箱",
+    "unit": "个"
+  }
+]

@@ -1,0 +1,12 @@
+[
+  {
+    "code": "PAPER",
+    "quantity": 20,
+    "reference": "IN-001"
+  },
+  {
+    "code": "PAPER",
+    "quantity": -6,
+    "reference": "OUT-001"
+  }
+]
