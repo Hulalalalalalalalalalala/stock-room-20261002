@@ -25,6 +25,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 - `register` → `StockRoom.register(...)`。参数名见 `core.py` 的公开方法签名。
 - `move` → `StockRoom.movement(...)`。参数名见 `core.py` 的公开方法签名。
+- `move-batch` → `StockRoom.movement_batch(rows)`，一次提交多笔普通出入库。输入对象含非空列表 `rows`，每行只能含 `code`、`quantity`、`reference` 三个字段；编码与编号去除首尾空白后区分大小写，`quantity` 为非零整数（正入负出，不接受布尔、小数或字符串）。整批按输入顺序计算各物料库存，任一行会使库存变负即抛出 `ValueError` 并拒绝整批，即使后续行入库可以补足也不例外。编号在批内不得重复，也不得与已有流水、盘点（含零差异盘点）或冲销编号冲突。任一行校验失败时不写入、不占用编号，`data.json` 的字节内容、库存、全部历史和最低库存配置保持原样；原先不存在的数据文件也不创建。成功后各行按顺序追加普通流水，返回与输入等长、同序的结果列表，每项含 `code`、`quantity`、`reference` 与 `balance`（该行完成后的该物料库存，而非整批最终库存）；这些流水可沿用 `reverse` 逐笔冲销，不另设批次编号或批次历史。
 - `stock` → `StockRoom.stock(...)`。参数名见 `core.py` 的公开方法签名。
 - `history` → `StockRoom.history(...)`。参数名见 `core.py` 的公开方法签名。
 - `count` → `StockRoom.count(code, counted, reference)`，按单个物料登记盘点。`counted` 为实点数量（非负整数）；返回 `code`、`reference`、`before`（盘点时库存）、`counted`、`difference`（实点减原库存），库存随后等于 `counted`。差异非零时在出入库流水中追加一条同字段记录（`quantity` 为差异、`reference` 为盘点编号）；零差异只登记盘点、不追加流水。

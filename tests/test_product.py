@@ -434,5 +434,197 @@ class MinimumStockTests(unittest.TestCase):
         self.assertIn("error", result.stderr)
 
 
+class MovementBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_balances_and_reopen(self):
+        results = self.app.movement_batch([
+            {"code": "PAPER", "quantity": -4, "reference": "B-OUT-1"},
+            {"code": "PAPER", "quantity": 2, "reference": "B-IN-1"},
+            {"code": "BOX", "quantity": 3, "reference": "B-BOX-IN"},
+        ])
+        self.assertEqual([row["balance"] for row in results], [10, 12, 3])
+        self.assertEqual([row["quantity"] for row in results], [-4, 2, 3])
+        self.assertEqual([row["reference"] for row in results], ["B-OUT-1", "B-IN-1", "B-BOX-IN"])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")], ["IN-001", "OUT-001", "B-OUT-1", "B-IN-1"])
+        self.assertEqual([row["reference"] for row in reopened.history("BOX")], ["B-BOX-IN"])
+
+    def test_later_replenishment_does_not_save_negative_row(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([
+                {"code": "BOX", "quantity": -1, "reference": "B-BOX-OUT"},
+                {"code": "BOX", "quantity": 4, "reference": "B-BOX-IN"},
+                {"code": "PAPER", "quantity": 1, "reference": "B-PAPER-IN"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 14)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in reopened.history("BOX")], [])
+        self.assertEqual(len(reopened.history("PAPER")), 2)
+
+    def test_failed_batch_after_first_sample_batch_preserves_state(self):
+        self.app.movement_batch([
+            {"code": "PAPER", "quantity": -4, "reference": "B-OUT-1"},
+            {"code": "PAPER", "quantity": 2, "reference": "B-IN-1"},
+            {"code": "BOX", "quantity": 3, "reference": "B-BOX-IN"},
+        ])
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([
+                {"code": "PAPER", "quantity": 1, "reference": "B-PAPER-IN"},
+                {"code": "BOX", "quantity": -4, "reference": "B-BOX-OUT"},
+            ])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")][-2:], ["B-OUT-1", "B-IN-1"])
+        self.assertEqual([row["reference"] for row in reopened.history("BOX")], ["B-BOX-IN"])
+
+    def test_invalid_rows_shape_rejected(self):
+        for rows in (None, [], {}, "x", 1):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.movement_batch(rows)
+
+    def test_invalid_row_shape_rejected(self):
+        good = {"code": "PAPER", "quantity": 1, "reference": "OK"}
+        for rows in (
+            [None],
+            ["PAPER"],
+            [[]],
+            [{"code": "PAPER", "quantity": 1}],
+            [{"code": "PAPER", "reference": "R"}],
+            [{"quantity": 1, "reference": "R"}],
+            [{"code": "PAPER", "quantity": 1, "reference": "R", "extra": 1}],
+            [good, good],
+        ):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.movement_batch(rows)
+
+    def test_invalid_identifiers_and_quantity_rejected(self):
+        for code in ("", "   ", 11, None, "UNKNOWN", "paper"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.movement_batch([{"code": code, "quantity": 1, "reference": "R"}])
+        for reference in ("", "   ", 11, None, "IN-001"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.movement_batch([{"code": "PAPER", "quantity": 1, "reference": reference}])
+        for quantity in (0, True, False, 1.5, "1", None, [1]):
+            with self.subTest(quantity=quantity):
+                with self.assertRaises(ValueError):
+                    self.app.movement_batch([{"code": "PAPER", "quantity": quantity, "reference": "R"}])
+
+    def test_identifiers_are_stripped_and_case_sensitive(self):
+        results = self.app.movement_batch([
+            {"code": "  PAPER  ", "quantity": 1, "reference": "  B-STRIP  "},
+        ])
+        self.assertEqual(results[0]["code"], "PAPER")
+        self.assertEqual(results[0]["reference"], "B-STRIP")
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([{"code": "PAPER", "quantity": 1, "reference": "  B-STRIP  "}])
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([{"code": "paper", "quantity": 1, "reference": "B-LOWER-CODE"}])
+
+    def test_reference_conflicts_within_batch_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([
+                {"code": "PAPER", "quantity": 1, "reference": "DUP"},
+                {"code": "BOX", "quantity": 1, "reference": "  DUP  "},
+            ])
+
+    def test_reference_conflicts_with_existing_histories_rejected(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        self.app.reverse("OUT-001", "REV-OUT")
+        for reference in ("IN-001", "CNT-ZERO", "REV-OUT"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.movement_batch([{"code": "PAPER", "quantity": 1, "reference": reference}])
+
+    def test_failed_batch_preserves_file_and_all_state(self):
+        self.app.set_minimum("BOX", 2)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([
+                {"code": "PAPER", "quantity": 1, "reference": "B-OK"},
+                {"code": "BOX", "quantity": -1, "reference": "B-BAD"},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([{"code": "PAPER", "quantity": 1, "reference": "IN-001"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+
+    def test_failed_batch_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.movement_batch([])
+        with self.assertRaises(ValueError):
+            app.movement_batch([{"code": "PAPER", "quantity": 1, "reference": "R"}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_batch_rows_can_be_reversed_one_by_one(self):
+        self.app.movement_batch([
+            {"code": "PAPER", "quantity": -4, "reference": "B-OUT-1"},
+            {"code": "PAPER", "quantity": 2, "reference": "B-IN-1"},
+        ])
+        record = self.app.reverse("B-OUT-1", "REV-B-OUT")
+        self.assertEqual((record["quantity"], record["balance"]), (4, 16))
+        with self.assertRaises(ValueError):
+            self.app.reverse("B-OUT-1", "REV-AGAIN")
+
+    def test_cli_move_batch_success_and_failure(self):
+        payload = self.root / "batch.json"
+        payload.write_text(json.dumps({"rows": [
+            {"code": "PAPER", "quantity": -4, "reference": "B-OUT-1"},
+            {"code": "PAPER", "quantity": 2, "reference": "B-IN-1"},
+            {"code": "BOX", "quantity": 3, "reference": "B-BOX-IN"},
+        ]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "move-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["balance"] for row in json.loads(result.stdout)], [10, 12, 3])
+        bad = self.root / "bad-batch.json"
+        bad.write_text(json.dumps({"rows": [
+            {"code": "PAPER", "quantity": 1, "reference": "B-PAPER-IN"},
+            {"code": "BOX", "quantity": -4, "reference": "B-BOX-OUT"},
+        ]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "move-batch", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", failed.stderr)
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 12)
+        self.assertEqual(StockRoom(self.root).stock("BOX")["quantity"], 3)
+
+    def test_cli_move_batch_array_keeps_earlier_batch(self):
+        payload = self.root / "batches.json"
+        payload.write_text(json.dumps([
+            {"rows": [{"code": "PAPER", "quantity": 1, "reference": "B-ONE"}]},
+            {"rows": [{"code": "BOX", "quantity": -9, "reference": "B-TWO"}]},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "move-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 15)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")][-1], "B-ONE")
+
+
 if __name__ == "__main__":
     unittest.main()
