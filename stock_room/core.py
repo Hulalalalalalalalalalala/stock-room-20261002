@@ -595,6 +595,49 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["reference"])
         return items
 
+    def save_supplier(self, supplier, contact="", phone="", note=""):
+        supplier = text(supplier, "supplier")
+        contact = _optional_text(contact, "contact")
+        phone = _optional_text(phone, "phone")
+        note = _optional_text(note, "note")
+        record = {"supplier": supplier, "contact": contact, "phone": phone, "note": note}
+        data = self._read()
+        data.setdefault("suppliers", {})[supplier] = record
+        self._write(data)
+        return dict(record)
+
+    def suppliers(self, keyword=""):
+        if not isinstance(keyword, str):
+            raise ValueError("keyword must be a string")
+        keyword = keyword.strip()
+        data = self._read()
+        records = data.get("suppliers", {})
+        names = set(records)
+        for order in data.get("purchases", []):
+            names.add(order["supplier"])
+        items = []
+        for name in sorted(names):
+            if keyword and keyword not in name:
+                continue
+            record = records.get(name)
+            if record is None:
+                record = {"supplier": name, "contact": "", "phone": "", "note": ""}
+            items.append(dict(record))
+        return items
+
+    def supplier_record(self, supplier):
+        supplier = text(supplier, "supplier")
+        data = self._read()
+        record = data.get("suppliers", {}).get(supplier)
+        orders = [order for order in data.get("purchases", []) if order["supplier"] == supplier]
+        if record is None and not orders:
+            raise ValueError("unknown supplier")
+        if record is None:
+            record = {"supplier": supplier, "contact": "", "phone": "", "note": ""}
+        purchases = [self._purchase_progress(data, order) for order in orders]
+        purchases.sort(key=lambda item: item["reference"])
+        return {**record, "purchases": purchases}
+
     def _purchase_progress(self, data, order):
         purchase_reference = order["reference"]
         received = self._received_totals(data, purchase_reference)
@@ -787,6 +830,11 @@ class StockRoom(JsonStore):
             raise ValueError("reference already exists")
         if any(row["reference"] == reference for row in data.get("counts", [])):
             raise ValueError("reference already exists")
+
+def _optional_text(value, label):
+    if not isinstance(value, str):
+        raise ValueError(label + " must be a string")
+    return value.strip()
 
 def _csv_field(value):
     # Strict CSV output: quote fields containing commas, quotes or line
