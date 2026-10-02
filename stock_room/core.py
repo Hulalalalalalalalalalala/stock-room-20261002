@@ -116,6 +116,75 @@ class StockRoom(JsonStore):
         self._write(data)
         return [dict(record) for record in parsed]
 
+    def import_movements_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("\ufeff"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 3 or set(header) != {"code", "quantity", "reference"}:
+            raise ValueError("header must contain exactly the code, quantity and reference columns")
+        positions = {name: header.index(name) for name in ("code", "quantity", "reference")}
+        entries = []
+        seen = set()
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 3:
+                raise ValueError("each record must have exactly three columns")
+            code = row[positions["code"]].strip()
+            reference = row[positions["reference"]].strip()
+            quantity_text = row[positions["quantity"]].strip()
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            digits = quantity_text[1:] if quantity_text.startswith("-") else quantity_text
+            if not digits or any(char < "0" or char > "9" for char in digits):
+                raise ValueError("quantity must be a nonzero integer")
+            quantity = int(quantity_text)
+            if quantity == 0:
+                raise ValueError("quantity must be a nonzero integer")
+            if reference in seen:
+                raise ValueError("reference already exists")
+            seen.add(reference)
+            entries.append({"code": code, "reference": reference, "quantity": quantity})
+        if not entries:
+            return []
+        data = self._read()
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        existing = data.get("movements", [])
+        balances = {}
+        parsed = []
+        for entry in entries:
+            code = entry["code"]
+            reference = entry["reference"]
+            quantity = entry["quantity"]
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+            self._require_unique_reference(data, reference)
+            if any(row["reference"] == reference for row in data.get("reversals", [])):
+                raise ValueError("reference already exists")
+            if code not in balances:
+                balances[code] = sum(row["quantity"] for row in existing if row["code"] == code)
+            balances[code] += quantity
+            if balances[code] < 0:
+                raise ValueError("insufficient stock")
+            parsed.append({"code": code, "quantity": quantity, "reference": reference, "balance": balances[code]})
+        data.setdefault("movements", []).extend(
+            {"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]} for row in parsed
+        )
+        self._write(data)
+        return parsed
+
     def update_material(self, code, name, unit):
         code, name, unit = text(code, "code"), text(name, "name"), text(unit, "unit")
         data = self._read()

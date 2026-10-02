@@ -1401,6 +1401,221 @@ class ImportCountsCsvTests(unittest.TestCase):
         self.assertEqual(self.app.counts("PAPER"), [])
 
 
+class ImportMovementsCsvTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_balances_survive_reopen_and_reverse(self):
+        result = self.app.import_movements_csv("code,quantity,reference\nPAPER,-4,MV-1\nPAPER,2,MV-2\nBOX,3,MV-3\n")
+        self.assertEqual(result, [
+            {"code": "PAPER", "quantity": -4, "reference": "MV-1", "balance": 10},
+            {"code": "PAPER", "quantity": 2, "reference": "MV-2", "balance": 12},
+            {"code": "BOX", "quantity": 3, "reference": "MV-3", "balance": 3},
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        ledger = reopened.movement_ledger("PAPER", kind="movement")
+        self.assertEqual([row["reference"] for row in ledger], ["IN-001", "OUT-001", "MV-1", "MV-2"])
+        reversal = reopened.reverse("MV-1", "REV-MV-1")
+        self.assertEqual(reversal["quantity"], 4)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 16)
+
+    def test_out_before_in_rejects_whole_file(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_movements_csv("code,quantity,reference\nBOX,-1,MV-1\nBOX,4,MV-2\n")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(self.app.history("BOX"), [])
+
+    def test_bom_crlf_reordered_header_and_quoted_fields(self):
+        content = "﻿reference,quantity,code\r\n\"MV,1\",-4, PAPER \r\n\r\n\"MV\"\"2\",2,PAPER\r\n"
+        result = self.app.import_movements_csv(content)
+        self.assertEqual([(row["code"], row["quantity"], row["reference"], row["balance"]) for row in result], [
+            ("PAPER", -4, "MV,1", 10),
+            ("PAPER", 2, 'MV"2', 12),
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+
+    def test_header_only_returns_empty_without_writing(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_movements_csv("code,quantity,reference\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.import_movements_csv("reference,code,quantity\r\n\r\n"), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_invalid_content_and_header_rejected(self):
+        for content in ("", "﻿", None, 11, ["code"], {"c": "x"}):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+        for content in (
+            "code,quantity\n",
+            "code,quantity,reference,extra\n",
+            "code,code,reference\n",
+            "code,quantity\nPAPER,1\n",
+            " code,quantity,reference\n",
+            "code ,quantity,reference\n",
+            "CODE,quantity,reference\n",
+            "code,count,reference\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+
+    def test_invalid_quotes_rejected(self):
+        for content in (
+            'code,quantity,reference\n"unclosed,1,R\n',
+            'code,quantity,reference\nPAPER,"1"2,R\n',
+            'code,quantity,reference\nPAPER, "1",R\n',
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+
+    def test_wrong_column_count_blank_fields_and_blank_like_records_rejected(self):
+        for content in (
+            "code,quantity,reference\nPAPER,1\n",
+            "code,quantity,reference\nPAPER,1,R,多\n",
+            "code,quantity,reference\n,1,R\n",
+            "code,quantity,reference\nPAPER,,R\n",
+            "code,quantity,reference\nPAPER,1,\n",
+            "code,quantity,reference\n   \n",
+            "code,quantity,reference\n,,\n",
+            "code,quantity,reference\nPAPER,1,R,\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+
+    def test_quantity_accepts_optional_minus_and_leading_zeros(self):
+        result = self.app.import_movements_csv("code,quantity,reference\nPAPER,-004,MV-1\nPAPER,007,MV-2\n")
+        self.assertEqual([(row["quantity"], row["balance"]) for row in result], [(-4, 10), (7, 17)])
+        for quantity in ("0", "-0", "00", "+1", "--1", "-", "1.0", "1e3", "1 2", "一", "0x1", "1."):
+            with self.subTest(quantity=quantity):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv("code,quantity,reference\nPAPER," + quantity + ",MV-X\n")
+
+    def test_identifiers_are_stripped_internal_whitespace_kept_and_case_sensitive(self):
+        result = self.app.import_movements_csv('code,quantity,reference\n PAPER ,1," MV A "\n')
+        self.assertEqual(result[0]["code"], "PAPER")
+        self.assertEqual(result[0]["reference"], "MV A")
+        with self.assertRaises(ValueError):
+            self.app.import_movements_csv("code,quantity,reference\npaper,1,MV-LOWER\n")
+
+    def test_duplicate_references_in_file_rejected_but_codes_may_repeat(self):
+        for content in (
+            "code,quantity,reference\nPAPER,1,R1\nBOX,1,R1\n",
+            "code,quantity,reference\nPAPER,1,R1\nBOX,1, R1 \n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+        result = self.app.import_movements_csv("code,quantity,reference\nPAPER,1,R1\nPAPER,2,R2\n")
+        self.assertEqual([row["balance"] for row in result], [15, 17])
+
+    def test_reference_conflicts_with_existing_movements_counts_and_reversals(self):
+        self.app.reverse("OUT-001", "REV-OUT")
+        self.app.count("BOX", 1, "CNT-EXIST")
+        for content in (
+            "code,quantity,reference\nPAPER,1,IN-001\n",
+            "code,quantity,reference\nPAPER,1,CNT-EXIST\n",
+            "code,quantity,reference\nPAPER,1,REV-OUT\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+
+    def test_unknown_and_inactive_materials_rejected(self):
+        self.app.set_active("BOX", False)
+        for content in (
+            "code,quantity,reference\nOTHER,1,MV-O\n",
+            "code,quantity,reference\nPAPER,1,MV-1\nOTHER,1,MV-O\n",
+            "code,quantity,reference\nBOX,1,MV-B\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_movements_csv(content)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+
+    def test_import_does_not_touch_material_profile_status_minimum_or_purchases(self):
+        self.app.set_minimum("PAPER", 15)
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 5}])
+        self.app.import_movements_csv("code,quantity,reference\nPAPER,-4,MV-1\n")
+        self.assertEqual(self.app.stock("PAPER"), {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 10})
+        self.assertEqual(self.app.material_status("PAPER")["active"], True)
+        self.assertEqual(self.app.inventory()[1]["minimum"], 15)
+        self.assertEqual(self.app.purchase_progress("PO-1")["rows"][0]["received"], 0)
+
+    def test_failed_import_preserves_file_and_all_state(self):
+        self.app.set_minimum("PAPER", 15)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_movements_csv("code,quantity,reference\nPAPER,1,MV-1\nPAPER,2,MV-1\n")
+        with self.assertRaises(ValueError):
+            self.app.import_movements_csv("code,quantity,reference\nPAPER,1,IN-001\n")
+        with self.assertRaises(ValueError):
+            self.app.import_movements_csv("code,quantity,reference\nPAPER,-99,MV-2\n")
+        with self.assertRaises(ValueError):
+            self.app.import_movements_csv(11)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["PAPER"])
+
+    def test_failed_import_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.import_movements_csv("code,quantity,reference\nPAPER,1\n")
+        with self.assertRaises(ValueError):
+            app.import_movements_csv("")
+        with self.assertRaises(ValueError):
+            app.import_movements_csv("code,quantity,reference\nPAPER,1,R\n")
+        self.assertFalse((empty / "data.json").exists())
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args], text=True, capture_output=True)
+
+    def test_cli_import_success_and_failure(self):
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"content": "code,quantity,reference\nPAPER,-4,MV-1\nBOX,3,MV-2\n"}), encoding="utf-8")
+        result = self.run_cli("import-movements-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["balance"] for row in json.loads(result.stdout)], [10, 3])
+        bad = self.root / "bad-import.json"
+        bad.write_text(json.dumps({"content": "code,quantity,reference\nPAPER,1,MV-1\n"}), encoding="utf-8")
+        failed = self.run_cli("import-movements-csv", str(bad))
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 10)
+
+    def test_cli_import_array_keeps_earlier_success(self):
+        payload = self.root / "imports.json"
+        payload.write_text(json.dumps([
+            {"content": "code,quantity,reference\nBOX,2,MV-B\n"},
+            {"content": "code,quantity,reference\nPAPER,1,MV-B\n"},
+        ]), encoding="utf-8")
+        result = self.run_cli("import-movements-csv", str(payload))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 2)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+
 class InventoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
