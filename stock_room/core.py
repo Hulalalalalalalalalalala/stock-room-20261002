@@ -1,4 +1,4 @@
-from .storage import JsonStore, text
+from .storage import JsonStore, positive, text
 
 class StockRoom(JsonStore):
     def register(self, code, name, unit):
@@ -254,6 +254,56 @@ class StockRoom(JsonStore):
             raise ValueError("unknown material")
         return {"code": code, "active": data.get("status", {}).get(code, True)}
 
+    def create_purchase(self, reference, supplier, rows):
+        reference = text(reference, "reference")
+        supplier = text(supplier, "supplier")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        purchases = data.get("purchases", [])
+        if any(order["reference"] == reference for order in purchases):
+            raise ValueError("purchase reference already exists")
+        parsed = []
+        seen = set()
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "quantity"}:
+                raise ValueError("each row must be an object with code and quantity")
+            code = text(entry["code"], "code")
+            quantity = positive(entry["quantity"], "quantity")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+            if code in seen:
+                raise ValueError("material already exists in purchase")
+            seen.add(code)
+            material = materials[code]
+            parsed.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity})
+        order = {"reference": reference, "supplier": supplier, "status": "open", "rows": parsed}
+        data.setdefault("purchases", []).append(order)
+        self._write(data)
+        return _purchase_view(order)
+
+    def purchase_order(self, reference):
+        reference = text(reference, "reference")
+        order = next((row for row in self._read().get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        return _purchase_view(order)
+
+    def cancel_purchase(self, reference):
+        reference = text(reference, "reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        if order["status"] == "open":
+            order["status"] = "cancelled"
+            self._write(data)
+        return _purchase_view(order)
+
     def set_minimum(self, code, minimum):
         code = text(code, "code")
         if type(minimum) is not int or minimum < 0:
@@ -321,6 +371,9 @@ class StockRoom(JsonStore):
             raise ValueError("reference already exists")
         if any(row["reference"] == reference for row in data.get("counts", [])):
             raise ValueError("reference already exists")
+
+def _purchase_view(order):
+    return {"reference": order["reference"], "supplier": order["supplier"], "status": order["status"], "rows": [dict(row) for row in order["rows"]]}
 
 def _csv_field(value):
     # Strict CSV output: quote fields containing commas, quotes or line

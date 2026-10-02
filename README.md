@@ -38,6 +38,9 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `set-minimum` → `StockRoom.set_minimum(code, minimum)`，为已登记物料设置最低库存。`minimum` 为非负整数（不接受布尔、小数、字符串或其他类型）；返回 `code` 与 `minimum`。再次设置覆盖原值，设为零即取消预警。设置不新增出入库流水或任何历史记录，也不占用编号。
 - `set-active` → `StockRoom.set_active(code, active)`，停用或恢复已登记物料。`active` 只接受布尔值（不接受整数、字符串或其他类型）；返回 `code` 与 `active`。停用不要求库存为零，不改变库存与任何历史；重复设置同一状态成功返回原状态。状态切换不产生流水或历史、不占用编号。停用后普通出入库（`move` 与 `move-batch`，无论数量正负）一律抛出 `ValueError`；`move-batch` 只要包含停用物料即整批拒绝，不保存其他合法行、不占用编号。盘点（`count`）与冲销（`reverse`）仍按既有规则处理停用物料，全部查询入口语义不变。恢复后普通出入库继续遵守已有校验。
 - `material-status` → `StockRoom.material_status(code)`，返回 `code` 与 `active`。新登记物料及旧数据中未设置状态的物料均视为启用（`active` 为 `true`）。查询不改写文件，也不为尚无数据的目录创建文件。
+- `create-purchase` → `StockRoom.create_purchase(reference, supplier, rows)`，登记采购单。`reference`（采购编号）、`supplier`（供应商名称）与每行 `code`（物料编码）均为去除首尾空白后非空的字符串，内部空白保留，编号与编码区分大小写。`rows` 为非空列表，每行只能含 `code`、`quantity` 两个字段；`quantity` 为正整数（不接受布尔、零、负数、小数或字符串）。物料必须已登记且处于启用状态；规范化后的物料编码在单内不得重复。`rows` 为空或非列表、行非对象或字段缺失或多余、字符串或数量非法、物料未知或停用、编码单内重复，均抛出 `ValueError`。成功时返回仅含 `reference`、`supplier`、`status`、`rows` 的对象，`status` 为 `open`；行按输入顺序排列，每行含 `code`、`name`、`unit`、`quantity`，名称与单位为登记时快照，后续物料资料或状态变化不改变单据内容。采购编号仅在采购单之间唯一，可以与已有出入库流水、盘点或冲销编号相同；重复采购编号抛出 `ValueError`。登记不改变库存、最低库存、物料状态或任何原有历史，也不占用出入库编号。业务校验失败时不占用采购编号，`data.json` 的原有字节保持不变，尚无文件时不创建。
+- `purchase-order` → `StockRoom.purchase_order(reference)`，按采购编号查询采购单，返回与登记时相同结构的对象（含取消后的 `cancelled` 状态与原始行）。编号不合法或不存在均抛出 `ValueError`。查询不改写文件；旧数据缺少采购单记录时视为无记录，也不补写文件。
+- `cancel-purchase` → `StockRoom.cancel_purchase(reference)`，将采购单状态由 `open` 改为 `cancelled` 并返回该对象；重复取消返回原状态（仍为 `cancelled` 的同一对象），不重复写文件。编号不合法或不存在均抛出 `ValueError`。取消不改变库存、最低库存、物料状态或任何原有历史，不受物料停用影响，也不占用出入库编号。采购单保存在 `root/data.json`，重新打开同一目录后仍可查询到状态与原始行。
 - `shortages` → `StockRoom.shortages()`，无参数，可省略输入文件。返回缺料物料对象列表，每项含 `code`、`name`、`unit`、`quantity`（当前台账库存）、`minimum` 与 `shortage`（`minimum` 减 `quantity`）。未设置最低库存的物料按零处理；仅库存严格小于最低库存的物料进入结果，按 `code` 的 Unicode 码点逐字符升序排列。没有缺料或尚未登记物料时返回空列表。查询不改写文件，也不为尚无数据的目录创建文件。
 - `inventory` → `StockRoom.inventory(keyword="", active=None)`，返回当前库存清单对象列表，每项含 `code`、`name`、`unit`、`quantity`、`minimum`、`active`。`keyword` 去除首尾空白后按区分大小写的字面子串匹配编码或名称，空字符串不筛选；`active` 为 `null` 时包含全部物料，为布尔值时只取对应状态；两个条件同时生效，结果按 `code` 的 Unicode 码点逐字符升序排列。
 - `export-inventory-csv` → `StockRoom.export_inventory_csv(keyword="", active=None)`，筛选参数与 `inventory` 完全相同，返回承载库存清单的 CSV 字符串。表头固定为 `code,name,unit,quantity,minimum,active`，每行一种物料，名称与单位取最新资料；库存包含出入库、盘点调整与冲销的全部影响；旧数据未记录最低库存或状态时分别输出零和 `true`，停用物料默认保留。整数使用无分组符的十进制文本，状态使用小写 `true` 或 `false`。文本不含 BOM，记录以 LF 结束且末条也有换行；字段包含逗号、双引号、CR 或 LF 时用双引号包裹，内部双引号成对转义，字段内部空白与换行原样保留。无物料或无匹配时仍只返回表头。`keyword` 不是字符串，或 `active` 不是 `null` 或布尔值时抛出 `ValueError`。导出不改变 `data.json` 的字节、库存、配置或任何历史，也不在尚无数据的目录创建文件；数据与筛选条件相同时导出字符串完全相同。命令成功时输出承载 CSV 的 JSON 字符串（JSON 数组输入时输出字符串数组），不扩展 CSV 导入格式。
@@ -58,4 +61,4 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 ## 当前边界
 
-当前仅支持一个仓库及整数数量（盘点实点数量同样为非负整数）。没有库位、采购单和多进程并发控制。不承诺并发写入或断电恢复。
+当前仅支持一个仓库及整数数量（盘点实点数量同样为非负整数）。采购单只做登记、查询与取消，不产生入库流水或库存影响；没有库位和多进程并发控制。不承诺并发写入或断电恢复。
