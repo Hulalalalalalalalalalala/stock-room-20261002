@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -5,6 +7,9 @@ import sys
 import tempfile
 import unittest
 from stock_room import StockRoom
+
+HEADER = "code,name,unit,quantity,minimum,active"
+HEADER_ONLY = HEADER + "\n"
 
 class ProductTests(unittest.TestCase):
     def setUp(self):
@@ -1310,6 +1315,273 @@ class InventoryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("error", result.stderr)
         self.assertEqual(before, self.app.path.read_bytes())
+
+
+class ExportInventoryCsvTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_minimum("BOX", 3)
+        self.app.set_active("BOX", False)
+
+    def seed_final_paper(self):
+        self.app.count("PAPER", 11, "CNT-001")
+        self.app.reverse("OUT-001", "REV-OUT")
+
+    def parse(self, content):
+        return list(csv.reader(io.StringIO(content), strict=True))
+
+    def codes(self, content):
+        return [row[0] for row in self.parse(content)[1:]]
+
+    def test_fixed_sample_default_then_count_and_reverse_final_export(self):
+        self.assertEqual(self.app.export_inventory_csv(),
+                         HEADER_ONLY + "BOX,纸箱,个,0,3,false\nPAPER,包装纸,张,14,15,true\n")
+        self.seed_final_paper()
+        expected = HEADER_ONLY + "BOX,纸箱,个,0,3,false\nPAPER,包装纸,张,17,15,true\n"
+        self.assertEqual(self.app.export_inventory_csv(), expected)
+        self.assertEqual(StockRoom(self.root).export_inventory_csv(), expected)
+
+    def test_header_column_count_order_and_cell_values(self):
+        self.seed_final_paper()
+        rows = self.parse(self.app.export_inventory_csv())
+        self.assertEqual(rows[0], ["code", "name", "unit", "quantity", "minimum", "active"])
+        self.assertEqual([len(row) for row in rows], [6, 6, 6])
+        self.assertEqual(rows[1], ["BOX", "纸箱", "个", "0", "3", "false"])
+        self.assertEqual(rows[2], ["PAPER", "包装纸", "张", "17", "15", "true"])
+        self.assertEqual(int(rows[1][3]), 0)
+        self.assertEqual(int(rows[2][3]), 17)
+
+    def test_rows_sorted_by_unicode_code_points(self):
+        self.app.register("纸张", "A4纸", "张")
+        self.seed_final_paper()
+        self.assertEqual(self.codes(self.app.export_inventory_csv()), ["BOX", "PAPER", "纸张"])
+
+    def test_integers_have_no_grouping_and_status_is_lowercase(self):
+        self.app.register("BULK", "散包", "个")
+        self.app.movement("BULK", 1000, "BULK-IN")
+        self.app.set_minimum("BULK", 2000)
+        content = self.app.export_inventory_csv()
+        self.assertIn("BULK,散包,个,1000,2000,true\n", content)
+        self.assertNotIn("1,000", content)
+        self.assertNotIn("True", content)
+        self.assertNotIn("False", content)
+        for row in self.parse(content)[1:]:
+            self.assertRegex(row[3], r"^-?\d+$")
+            self.assertRegex(row[4], r"^\d+$")
+            self.assertIn(row[5], ("true", "false"))
+
+    def test_rename_changes_export_but_keeps_history_values(self):
+        self.seed_final_paper()
+        self.app.update_material("PAPER", "加厚包装纸", "张")
+        content = self.app.export_inventory_csv()
+        paper = next(row for row in self.parse(content) if row[0] == "PAPER")
+        self.assertEqual(paper, ["PAPER", "加厚包装纸", "张", "17", "15", "true"])
+        self.assertEqual([row["quantity"] for row in self.app.history("PAPER")], [20, -6, -3, 6])
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")],
+                         ["IN-001", "OUT-001", "CNT-001", "REV-OUT"])
+        self.assertEqual([row["counted"] for row in self.app.counts("PAPER")], [11])
+        self.assertEqual([row["original_reference"] for row in self.app.reversals("PAPER")], ["OUT-001"])
+        box = next(row for row in self.parse(content) if row[0] == "BOX")
+        self.assertEqual(box[1], "纸箱")
+
+    def test_special_name_quoting_escaping_and_round_trip(self):
+        special_name = '特,殊"纸\n单\r行 内\t部'
+        self.app.register("SPECIAL", special_name, "个")
+        content = self.app.export_inventory_csv()
+        quoted = '"' + special_name.replace('"', '""') + '"'
+        self.assertIn("SPECIAL," + quoted + ",个,0,0,true\n", content)
+        rows = self.parse(content)
+        self.assertEqual(len(rows), 4)
+        record = next(row for row in rows if row[0] == "SPECIAL")
+        self.assertEqual(record, ["SPECIAL", special_name, "个", "0", "0", "true"])
+
+    def test_no_bom_lf_separators_and_trailing_newline(self):
+        content = self.app.export_inventory_csv()
+        encoded = content.encode("utf-8")
+        self.assertFalse(encoded.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\xef\xbb\xbf", encoded)
+        self.assertNotIn("\r", content)
+        self.assertTrue(content.startswith(HEADER + "\n"))
+        self.assertTrue(content.endswith("\n"))
+        self.assertFalse(content.endswith("\n\n"))
+        lines = content.split("\n")
+        self.assertEqual(lines[-1], "")
+        self.assertTrue(all(lines[:-1]))
+        self.assertEqual(len(lines), 4)
+
+    def test_keyword_is_trimmed_and_matched_literally_case_sensitively(self):
+        export = self.app.export_inventory_csv
+        self.assertEqual(self.codes(export(keyword="  PAPER  ")), ["PAPER"])
+        self.assertEqual(self.codes(export(keyword="paper")), [])
+        self.assertEqual(self.codes(export(keyword="BOX")), ["BOX"])
+        self.assertEqual(self.codes(export(keyword="box")), [])
+        self.assertEqual(self.codes(export(keyword="纸箱")), ["BOX"])
+        self.assertEqual(self.codes(export(keyword="纸")), ["BOX", "PAPER"])
+        self.assertEqual(self.codes(export(keyword="   ")), ["BOX", "PAPER"])
+        self.assertEqual(self.codes(export(keyword=".")), [])
+        self.assertEqual(self.codes(export(keyword=".*")), [])
+        self.assertEqual(self.codes(export(keyword="不存在")), [])
+
+    def test_active_filter_alone_and_combined_with_keyword(self):
+        export = self.app.export_inventory_csv
+        self.assertEqual(self.codes(export(active=True)), ["PAPER"])
+        self.assertEqual(self.codes(export(active=False)), ["BOX"])
+        self.assertEqual(self.codes(export(keyword="纸", active=True)), ["PAPER"])
+        self.assertEqual(self.codes(export(keyword="纸", active=False)), ["BOX"])
+        self.assertEqual(self.codes(export(keyword="PAPER", active=False)), [])
+
+    def test_no_match_returns_header_only(self):
+        self.assertEqual(self.app.export_inventory_csv(keyword="不存在"), HEADER_ONLY)
+        self.assertEqual(self.app.export_inventory_csv(keyword="PAPER", active=False), HEADER_ONLY)
+
+    def test_empty_directory_exports_header_only_without_creating_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.export_inventory_csv(), HEADER_ONLY)
+        self.assertEqual(app.export_inventory_csv(keyword="纸", active=True), HEADER_ONLY)
+        self.assertFalse((empty / "data.json").exists())
+        with self.assertRaises(ValueError):
+            app.export_inventory_csv(keyword=11)
+        with self.assertRaises(ValueError):
+            app.export_inventory_csv(active=1)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_invalid_arguments_rejected(self):
+        for keyword in (None, 1, True, 1.5, ["纸"], {"k": "纸"}):
+            with self.subTest(keyword=keyword):
+                with self.assertRaises(ValueError):
+                    self.app.export_inventory_csv(keyword=keyword)
+        for active in (0, 1, "true", "false", 1.0, [True], {"a": True}):
+            with self.subTest(active=active):
+                with self.assertRaises(ValueError):
+                    self.app.export_inventory_csv(active=active)
+
+    def test_export_is_repeatable_and_read_only(self):
+        self.seed_final_paper()
+        before = self.app.path.read_bytes()
+        first = self.app.export_inventory_csv()
+        filters = ({}, {"keyword": "纸"}, {"keyword": "纸", "active": True}, {"active": False}, {"keyword": "不存在"})
+        for kwargs in filters:
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(self.app.export_inventory_csv(**kwargs),
+                                 StockRoom(self.root).export_inventory_csv(**kwargs))
+        self.assertEqual(self.app.export_inventory_csv(), first)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(StockRoom(self.root).path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 17)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["quantity"] for row in self.app.history("PAPER")], [20, -6, -3, 6])
+        self.assertEqual(len(self.app.counts("PAPER")), 1)
+        self.assertEqual(len(self.app.reversals("PAPER")), 1)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+
+    def test_rejected_export_preserves_bytes_stock_config_and_histories(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.export_inventory_csv(keyword=11)
+        with self.assertRaises(ValueError):
+            self.app.export_inventory_csv(active=1)
+        with self.assertRaises(ValueError):
+            self.app.export_inventory_csv(active=0)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX", "PAPER"])
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+
+    def test_legacy_data_defaults_to_zero_minimum_and_true_after_reopen(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        path = legacy / "data.json"
+        document = {
+            "materials": {
+                "OLD": {"code": "OLD", "name": "旧料", "unit": "个"},
+                "NEW": {"code": "NEW", "name": "新料", "unit": "卷"},
+            },
+            "movements": [{"code": "OLD", "quantity": 5, "reference": "OLD-IN"}],
+        }
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        before = path.read_bytes()
+        expected = HEADER_ONLY + "NEW,新料,卷,0,0,true\nOLD,旧料,个,5,0,true\n"
+        self.assertEqual(StockRoom(legacy).export_inventory_csv(), expected)
+        self.assertEqual(StockRoom(legacy).export_inventory_csv(), expected)
+        self.assertEqual(path.read_bytes(), before)
+
+    def run_cli(self, root, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(root), *args],
+                              text=True, capture_output=True)
+
+    def test_cli_export_success_prints_csv_carried_by_json_string(self):
+        self.seed_final_paper()
+        result = self.run_cli(self.root, "export-inventory-csv")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, self.app.export_inventory_csv())
+        payload = self.root / "filter.json"
+        payload.write_text(json.dumps({"keyword": "  纸  ", "active": True}), encoding="utf-8")
+        result = self.run_cli(self.root, "export-inventory-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value, self.app.export_inventory_csv(keyword="纸", active=True))
+        self.assertEqual(self.codes(value), ["PAPER"])
+
+    def test_cli_export_array_returns_strings_in_order(self):
+        payload = self.root / "queries.json"
+        payload.write_text(json.dumps([
+            {"keyword": "纸"},
+            {"keyword": "paper"},
+            {},
+        ]), encoding="utf-8")
+        result = self.run_cli(self.root, "export-inventory-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertIsInstance(value, list)
+        self.assertEqual(value, [
+            self.app.export_inventory_csv(keyword="纸"),
+            self.app.export_inventory_csv(keyword="paper"),
+            self.app.export_inventory_csv(),
+        ])
+        self.assertTrue(all(isinstance(item, str) for item in value))
+        self.assertEqual(self.codes(value[0]), ["BOX", "PAPER"])
+        self.assertEqual(value[1], HEADER_ONLY)
+
+    def test_cli_invalid_filter_returns_2_empty_stdout_json_error(self):
+        before = self.app.path.read_bytes()
+        for body in ({"keyword": 11}, {"active": 1}, {"active": 0}):
+            with self.subTest(body=body):
+                payload = self.root / "bad-filter.json"
+                payload.write_text(json.dumps(body), encoding="utf-8")
+                result = self.run_cli(self.root, "export-inventory-csv", str(payload))
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("error", json.loads(result.stderr))
+        payload = self.root / "bad-filter-array.json"
+        payload.write_text(json.dumps([{"keyword": "纸"}, {"active": 1}]), encoding="utf-8")
+        result = self.run_cli(self.root, "export-inventory-csv", str(payload))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_empty_directory_exports_header_only_without_file(self):
+        empty = self.root / "empty"
+        result = self.run_cli(empty, "export-inventory-csv")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), HEADER_ONLY)
+        self.assertFalse((empty / "data.json").exists())
 
 
 if __name__ == "__main__":
