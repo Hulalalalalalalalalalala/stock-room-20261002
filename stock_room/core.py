@@ -457,6 +457,76 @@ class StockRoom(JsonStore):
         self._write(data)
         return self._purchase_snapshot(order)
 
+    def import_purchases_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 4 or set(header) != {"reference", "supplier", "code", "quantity"}:
+            raise ValueError("header must contain exactly the reference, supplier, code and quantity columns")
+        positions = {name: header.index(name) for name in ("reference", "supplier", "code", "quantity")}
+        entries = []
+        orders = {}
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 4:
+                raise ValueError("each record must have exactly four columns")
+            reference = row[positions["reference"]].strip()
+            supplier = row[positions["supplier"]].strip()
+            code = row[positions["code"]].strip()
+            quantity_text = row[positions["quantity"]].strip()
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            if not supplier:
+                raise ValueError("supplier must be a nonempty string")
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            if not quantity_text or any(char < "0" or char > "9" for char in quantity_text):
+                raise ValueError("quantity must be a positive integer")
+            quantity = int(quantity_text)
+            if quantity == 0:
+                raise ValueError("quantity must be a positive integer")
+            order = orders.get(reference)
+            if order is None:
+                order = {"reference": reference, "supplier": supplier, "rows": []}
+                orders[reference] = order
+                entries.append(order)
+            elif order["supplier"] != supplier:
+                raise ValueError("supplier must be consistent within a purchase")
+            if any(line["code"] == code for line in order["rows"]):
+                raise ValueError("material already exists in purchase")
+            order["rows"].append({"code": code, "quantity": quantity})
+        if not entries:
+            return []
+        data = self._read()
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        existing = {order["reference"] for order in data.get("purchases", [])}
+        parsed_orders = []
+        for entry in entries:
+            if entry["reference"] in existing:
+                raise ValueError("reference already exists")
+            parsed_rows = []
+            for line in entry["rows"]:
+                code = line["code"]
+                if code not in materials:
+                    raise ValueError("unknown material")
+                if not status.get(code, True):
+                    raise ValueError("material is inactive")
+                material = materials[code]
+                parsed_rows.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": line["quantity"]})
+            parsed_orders.append({"reference": entry["reference"], "supplier": entry["supplier"], "status": "open", "rows": parsed_rows})
+        data.setdefault("purchases", []).extend(parsed_orders)
+        self._write(data)
+        return [self._purchase_snapshot(order) for order in parsed_orders]
+
     def purchase_order(self, reference):
         reference = text(reference, "reference")
         data = self._read()
