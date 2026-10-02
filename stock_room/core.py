@@ -18,6 +18,8 @@ class StockRoom(JsonStore):
         data = self._read()
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
+        if not data.get("statuses", {}).get(code, True):
+            raise ValueError("material is inactive")
         rows = data.setdefault("movements", [])
         self._require_unique_reference(data, reference)
         stock = sum(row["quantity"] for row in rows if row["code"] == code)
@@ -47,6 +49,8 @@ class StockRoom(JsonStore):
                 raise ValueError("quantity must be a nonzero integer")
             if code not in materials:
                 raise ValueError("unknown material")
+            if not data.get("statuses", {}).get(code, True):
+                raise ValueError("material is inactive")
             if reference in seen:
                 raise ValueError("reference already exists")
             self._require_unique_reference(data, reference)
@@ -143,6 +147,24 @@ class StockRoom(JsonStore):
         data.setdefault("minimums", {})[code] = minimum
         self._write(data)
         return {"code": code, "minimum": minimum}
+
+    def set_active(self, code, active):
+        code = text(code, "code")
+        if type(active) is not bool:
+            raise ValueError("active must be a boolean")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        data.setdefault("statuses", {})[code] = active
+        self._write(data)
+        return {"code": code, "active": active}
+
+    def material_status(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return {"code": code, "active": data.get("statuses", {}).get(code, True)}
 
     def shortages(self):
         data = self._read()
