@@ -415,6 +415,32 @@ class StockRoom(JsonStore):
         order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
         if order is None:
             raise ValueError("unknown purchase reference")
+        return self._purchase_progress(data, order)
+
+    def purchase_orders(self, supplier="", status=None, progress=None):
+        if not isinstance(supplier, str):
+            raise ValueError("supplier must be a string")
+        if status is not None and status not in ("open", "cancelled"):
+            raise ValueError("status must be open, cancelled or None")
+        if progress is not None and progress not in ("pending", "partial", "complete"):
+            raise ValueError("progress must be pending, partial, complete or None")
+        supplier = supplier.strip()
+        data = self._read()
+        items = []
+        for order in data.get("purchases", []):
+            if supplier and supplier not in order["supplier"]:
+                continue
+            if status is not None and order["status"] != status:
+                continue
+            item = self._purchase_progress(data, order)
+            if progress is not None and item["progress"] != progress:
+                continue
+            items.append(item)
+        items.sort(key=lambda item: item["reference"])
+        return items
+
+    def _purchase_progress(self, data, order):
+        purchase_reference = order["reference"]
         received = self._received_totals(data, purchase_reference)
         returned = self._returned_totals(data, purchase_reference)
         rows = []
@@ -435,13 +461,13 @@ class StockRoom(JsonStore):
                 "net_received": received_qty - returned_qty,
                 "remaining": line["quantity"] - received_qty,
             })
-        progress = "pending" if all_pending else "complete" if all_complete else "partial"
+        state = "pending" if all_pending else "complete" if all_complete else "partial"
         return {
             "reference": order["reference"],
             "supplier": order["supplier"],
             "status": order["status"],
             "rows": rows,
-            "progress": progress,
+            "progress": state,
         }
 
     @staticmethod
