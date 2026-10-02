@@ -198,6 +198,28 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def inventory(self, keyword="", active=None):
+        if not isinstance(keyword, str):
+            raise ValueError("keyword must be a string")
+        if active is not None and type(active) is not bool:
+            raise ValueError("active must be a boolean or null")
+        keyword = keyword.strip()
+        data = self._read()
+        rows = data.get("movements", [])
+        minimums = data.get("minimums", {})
+        status = data.get("status", {})
+        items = []
+        for code, material in data.get("materials", {}).items():
+            enabled = status.get(code, True)
+            if active is not None and enabled != active:
+                continue
+            if keyword and keyword not in code and keyword not in material["name"]:
+                continue
+            quantity = sum(row["quantity"] for row in rows if row["code"] == code)
+            items.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity, "minimum": minimums.get(code, 0), "active": enabled})
+        items.sort(key=lambda item: item["code"])
+        return items
+
     @staticmethod
     def _require_unique_reference(data, reference):
         if any(row["reference"] == reference for row in data.get("movements", [])):

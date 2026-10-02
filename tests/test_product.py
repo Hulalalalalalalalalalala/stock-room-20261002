@@ -974,5 +974,124 @@ class UpdateMaterialTests(unittest.TestCase):
         self.assertEqual(self.app.stock("PAPER"), {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 14})
 
 
+class InventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_minimum("BOX", 3)
+        self.app.set_active("BOX", False)
+
+    def test_fixed_sample_unfiltered_sorted_by_code(self):
+        self.assertEqual(self.app.inventory(), [
+            {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 0, "minimum": 3, "active": False},
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 14, "minimum": 15, "active": True},
+        ])
+
+    def test_fixed_sample_keyword_and_active_filters(self):
+        self.assertEqual([item["code"] for item in self.app.inventory(keyword="纸")], ["BOX", "PAPER"])
+        self.assertEqual(self.app.inventory(keyword="纸", active=True), [
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 14, "minimum": 15, "active": True},
+        ])
+        self.assertEqual(self.app.inventory(keyword="paper"), [])
+
+    def test_fixed_sample_rename_and_count_survive_reopen(self):
+        self.app.update_material("PAPER", "加厚包装纸", "张")
+        self.app.count("PAPER", 11, "CNT-001")
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.inventory()[1], {"code": "PAPER", "name": "加厚包装纸", "unit": "张", "quantity": 11, "minimum": 15, "active": True})
+
+    def test_defaults_match_explicit_empty_keyword_and_none_active(self):
+        self.assertEqual(self.app.inventory(), self.app.inventory(keyword="", active=None))
+        self.assertEqual(self.app.inventory(keyword="   "), self.app.inventory())
+
+    def test_keyword_matches_code_and_name_literally(self):
+        self.assertEqual([item["code"] for item in self.app.inventory(keyword="BOX")], ["BOX"])
+        self.assertEqual([item["code"] for item in self.app.inventory(keyword="箱")], ["BOX"])
+        self.assertEqual(self.app.inventory(keyword="box"), [])
+        self.assertEqual(self.app.inventory(keyword=".*"), [])
+        self.assertEqual([item["code"] for item in self.app.inventory(keyword=" 纸 ")], ["BOX", "PAPER"])
+        self.assertEqual(self.app.inventory(keyword="纸 箱"), [])
+
+    def test_active_false_returns_only_inactive(self):
+        self.assertEqual([item["code"] for item in self.app.inventory(active=False)], ["BOX"])
+
+    def test_invalid_arguments_rejected(self):
+        for keyword in (11, None, True, ["纸"]):
+            with self.subTest(keyword=keyword):
+                with self.assertRaises(ValueError):
+                    self.app.inventory(keyword=keyword)
+        for active in (0, 1, "true", "false", 1.0, [True]):
+            with self.subTest(active=active):
+                with self.assertRaises(ValueError):
+                    self.app.inventory(active=active)
+
+    def test_query_does_not_modify_file_or_consume_reference(self):
+        before = self.app.path.read_bytes()
+        self.app.inventory()
+        self.app.inventory(keyword="纸", active=True)
+        with self.assertRaises(ValueError):
+            self.app.inventory(keyword=11)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001", "OUT-001"])
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_empty_directory_returns_empty_without_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.inventory(), [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_unset_minimum_and_legacy_status_defaults(self):
+        self.app.register("FILM", "薄膜", "卷")
+        self.assertEqual(self.app.inventory(keyword="FILM"), [
+            {"code": "FILM", "name": "薄膜", "unit": "卷", "quantity": 0, "minimum": 0, "active": True},
+        ])
+
+    def test_cli_inventory_without_input_and_with_filters(self):
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "inventory"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["code"] for row in json.loads(result.stdout)], ["BOX", "PAPER"])
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"keyword": "纸", "active": True}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "inventory", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["code"] for row in json.loads(result.stdout)], ["PAPER"])
+        payload.write_text(json.dumps({"keyword": "纸", "active": None}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "inventory", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["code"] for row in json.loads(result.stdout)], ["BOX", "PAPER"])
+
+    def test_cli_inventory_array_returns_results_in_order(self):
+        payload = self.root / "queries.json"
+        payload.write_text(json.dumps([
+            {"keyword": "纸", "active": True},
+            {"keyword": "paper"},
+            {},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "inventory", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([[row["code"] for row in rows] for rows in value], [["PAPER"], [], ["BOX", "PAPER"]])
+
+    def test_cli_inventory_invalid_arguments_return_2_and_preserve_file(self):
+        before = self.app.path.read_bytes()
+        for payload_data in ({"keyword": 11}, {"active": "true"}, {"active": 1}):
+            with self.subTest(payload_data=payload_data):
+                payload = self.root / "bad-query.json"
+                payload.write_text(json.dumps(payload_data), encoding="utf-8")
+                result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "inventory", str(payload)], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("error", result.stderr)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+
 if __name__ == "__main__":
     unittest.main()
