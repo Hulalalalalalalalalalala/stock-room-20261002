@@ -974,6 +974,188 @@ class UpdateMaterialTests(unittest.TestCase):
         self.assertEqual(self.app.stock("PAPER"), {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 14})
 
 
+class CsvImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_conflict_rejects_whole_file(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nTAPE,胶带,卷\nPAPER,包装纸,张\n")
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.stock("TAPE")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_fixed_sample_import_survives_reopen(self):
+        result = self.app.import_materials_csv("code,name,unit\nTAPE,胶带,卷\nBAG,包装袋,个\n")
+        self.assertEqual(result, [
+            {"code": "TAPE", "name": "胶带", "unit": "卷"},
+            {"code": "BAG", "name": "包装袋", "unit": "个"},
+        ])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("TAPE"), {"code": "TAPE", "name": "胶带", "unit": "卷", "quantity": 0})
+        self.assertEqual(reopened.stock("BAG")["quantity"], 0)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 14)
+        self.assertEqual(reopened.material_status("TAPE"), {"code": "TAPE", "active": True})
+        rows = {row["code"]: row for row in reopened.inventory()}
+        self.assertEqual(rows["BAG"]["minimum"], 0)
+        self.assertEqual(rows["BAG"]["active"], True)
+        self.assertEqual(reopened.history("TAPE"), [])
+        self.assertEqual(reopened.counts("TAPE"), [])
+        self.assertEqual(reopened.reversals("TAPE"), [])
+        record = reopened.movement("TAPE", 3, "TAPE-IN")
+        self.assertEqual(record["balance"], 3)
+        self.assertEqual(StockRoom(self.root).stock("TAPE")["quantity"], 3)
+
+    def test_bom_crlf_reordered_header_and_quoted_fields(self):
+        content = "﻿unit,code,name\r\n卷,GLUE,\"强力\r\n胶\"\"水\"\"\"\r\n\r\n个, BOX , 箱 子 \r\n"
+        result = self.app.import_materials_csv(content)
+        self.assertEqual(result, [
+            {"code": "GLUE", "name": "强力\r\n胶\"水\"", "unit": "卷"},
+            {"code": "BOX", "name": "箱 子", "unit": "个"},
+        ])
+        self.assertEqual(StockRoom(self.root).stock("GLUE")["name"], "强力\r\n胶\"水\"")
+
+    def test_quoted_fields_may_contain_commas(self):
+        result = self.app.import_materials_csv('code,name,unit\n"G,LUE","胶,水",卷\n')
+        self.assertEqual(result, [{"code": "G,LUE", "name": "胶,水", "unit": "卷"}])
+
+    def test_header_only_returns_empty_without_writing(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_materials_csv("code,name,unit\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.import_materials_csv("unit,code,name\r\n\r\n"), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_invalid_content_and_header_rejected(self):
+        for content in ("", "﻿", None, 11, ["code"], {"c": "x"}):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+        for content in (
+            "code,name\n",
+            "code,name,unit,extra\n",
+            "code,code,unit\n",
+            "code,name\nA,纸\n",
+            " code,name,unit\n",
+            "code ,name,unit\n",
+            "CODE,name,unit\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+
+    def test_invalid_quotes_rejected(self):
+        for content in (
+            'code,name,unit\n"unclosed,纸,张\n',
+            'code,name,unit\nA"x,纸,张\n',
+            'code,name,unit\n"x"y,纸,张\n',
+            'code,name,unit\n"x" y,纸,张\n',
+            'code,name,unit\n "x",纸,张\n',
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+
+    def test_wrong_column_count_and_empty_fields_rejected(self):
+        for content in (
+            "code,name,unit\nA,纸\n",
+            "code,name,unit\nA,纸,张,多\n",
+            "code,name,unit\nA,,张\n",
+            "code,name,unit\nA,  ,张\n",
+            "code,name,unit\n,,\n",
+            "code,name,unit\n   \n",
+            "code,name,unit\nA,纸,张,\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+
+    def test_duplicate_codes_rejected_and_codes_are_case_sensitive(self):
+        for content in (
+            "code,name,unit\nA,纸,张\nA,纸,张\n",
+            "code,name,unit\nA,纸,张\n A ,纸,张\n",
+            "code,name,unit\nPAPER,包装纸,张\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+        result = self.app.import_materials_csv("code,name,unit\npaper,复印纸,张\n")
+        self.assertEqual(result, [{"code": "paper", "name": "复印纸", "unit": "张"}])
+
+    def test_inactive_material_code_still_conflicts(self):
+        self.app.set_active("PAPER", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nPAPER,包装纸,张\n")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+
+    def test_failed_import_preserves_file_and_all_state(self):
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_active("PAPER", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nTAPE,胶带,卷\nTAPE,胶带,卷\n")
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nTAPE,胶带\n")
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv(11)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["PAPER"])
+
+    def test_failed_import_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.import_materials_csv("code,name,unit\nA,纸\n")
+        with self.assertRaises(ValueError):
+            app.import_materials_csv("")
+        self.assertFalse((empty / "data.json").exists())
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args], text=True, capture_output=True)
+
+    def test_cli_import_success_and_failure(self):
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"content": "code,name,unit\nTAPE,胶带,卷\nBAG,包装袋,个\n"}), encoding="utf-8")
+        result = self.run_cli("import-materials-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["code"] for row in json.loads(result.stdout)], ["TAPE", "BAG"])
+        bad = self.root / "bad-import.json"
+        bad.write_text(json.dumps({"content": "code,name,unit\nGLUE,胶水,瓶\nPAPER,包装纸,张\n"}), encoding="utf-8")
+        failed = self.run_cli("import-materials-csv", str(bad))
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        with self.assertRaises(ValueError):
+            self.app.stock("GLUE")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_cli_import_array_keeps_earlier_success(self):
+        payload = self.root / "imports.json"
+        payload.write_text(json.dumps([
+            {"content": "code,name,unit\nBOX,纸箱,个\n"},
+            {"content": "code,name,unit\nPAPER,包装纸,张\n"},
+        ]), encoding="utf-8")
+        result = self.run_cli("import-materials-csv", str(payload))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+
 class InventoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

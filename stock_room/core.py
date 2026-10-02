@@ -11,6 +11,49 @@ class StockRoom(JsonStore):
         self._write(data)
         return materials[code]
 
+    def import_materials_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("\ufeff"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 3 or set(header) != {"code", "name", "unit"}:
+            raise ValueError("header must contain exactly the code, name and unit columns")
+        positions = {name: header.index(name) for name in ("code", "name", "unit")}
+        records = []
+        seen = set()
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 3:
+                raise ValueError("each record must have exactly three columns")
+            fields = {}
+            for name, index in positions.items():
+                value = row[index].strip()
+                if not value:
+                    raise ValueError(name + " must be a nonempty string")
+                fields[name] = value
+            if fields["code"] in seen:
+                raise ValueError("material already exists")
+            seen.add(fields["code"])
+            records.append(fields)
+        if not records:
+            return []
+        data = self._read()
+        materials = data.setdefault("materials", {})
+        for fields in records:
+            if fields["code"] in materials:
+                raise ValueError("material already exists")
+        for fields in records:
+            materials[fields["code"]] = dict(fields)
+        self._write(data)
+        return [dict(fields) for fields in records]
+
     def update_material(self, code, name, unit):
         code, name, unit = text(code, "code"), text(name, "name"), text(unit, "unit")
         data = self._read()
@@ -263,3 +306,60 @@ class StockRoom(JsonStore):
             raise ValueError("reference already exists")
         if any(row["reference"] == reference for row in data.get("counts", [])):
             raise ValueError("reference already exists")
+
+def _parse_csv(content):
+    # Strict CSV: comma-separated fields, double-quoted fields may contain
+    # commas, quotes (escaped as "") and newlines. Blank lines parse to [].
+    records = []
+    index = 0
+    length = len(content)
+    while index < length:
+        if content[index] in "\r\n":
+            records.append([])
+            index += 1
+            if content[index - 1] == "\r" and index < length and content[index] == "\n":
+                index += 1
+            continue
+        fields = []
+        while True:
+            if content[index] == '"':
+                index += 1
+                chars = []
+                while True:
+                    if index >= length:
+                        raise ValueError("unterminated quoted field")
+                    if content[index] == '"':
+                        if index + 1 < length and content[index + 1] == '"':
+                            chars.append('"')
+                            index += 2
+                        else:
+                            index += 1
+                            break
+                    else:
+                        chars.append(content[index])
+                        index += 1
+                if index < length and content[index] not in ",\r\n":
+                    raise ValueError("unexpected character after closing quote")
+                fields.append("".join(chars))
+            else:
+                start = index
+                while index < length and content[index] not in ",\r\n":
+                    if content[index] == '"':
+                        raise ValueError("unexpected quote in unquoted field")
+                    index += 1
+                fields.append(content[start:index])
+            if index < length and content[index] == ",":
+                index += 1
+                if index >= length or content[index] in "\r\n":
+                    fields.append("")
+                    break
+                continue
+            break
+        if index < length and content[index] == "\r":
+            index += 1
+            if index < length and content[index] == "\n":
+                index += 1
+        elif index < length and content[index] == "\n":
+            index += 1
+        records.append(fields)
+    return records
