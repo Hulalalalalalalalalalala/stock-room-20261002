@@ -31,6 +31,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `history` → `StockRoom.history(...)`。参数名见 `core.py` 的公开方法签名。
 - `count` → `StockRoom.count(code, counted, reference)`，按单个物料登记盘点。`counted` 为实点数量（非负整数）；返回 `code`、`reference`、`before`（盘点时库存）、`counted`、`difference`（实点减原库存），库存随后等于 `counted`。差异非零时在出入库流水中追加一条同字段记录（`quantity` 为差异、`reference` 为盘点编号）；零差异只登记盘点、不追加流水。
 - `counts` → `StockRoom.counts(code)`，按登记顺序返回该物料的盘点对象列表；已登记但无盘点记录的物料返回空列表。后续出入库不改变已保存的盘点数值。
+- `count-batch` → `StockRoom.count_batch(rows)`，一次提交多种物料的实点结果共同生效。输入对象含非空列表 `rows`，每行只能含 `code`、`counted`、`reference` 三个字段；编码与编号去除首尾空白后区分大小写（内部空白保留），`counted` 为非负整数（不接受布尔、小数或字符串）。启用与停用物料均可盘点。返回与输入等长、同序的结果列表，每项沿用单物料盘点的 `code`、`reference`、`before`、`counted`、`difference` 五个字段；`before` 取提交前台账值，差异为实点减原库存，完成后库存等于实点数量。成功时按输入顺序追加盘点记录，仅为非零差异追加同编号的调整流水，零差异也占用编号但不追加流水。去除首尾空白后的物料编码在批内不得重复；编号既不能批内重复，也不能与任何物料的流水、盘点或冲销编号冲突。`rows` 为空或非列表、行非对象或字段缺失或多余、字符串或数量不合法、物料不存在、批内物料重复及编号冲突均抛出 `ValueError` 并整批拒绝：不写入、不占用编号，`data.json` 的字节、库存、全部历史、最低库存和状态保持原样，尚无数据文件时不创建，修正后可复用失败请求中的编号。批内盘点与单物料盘点同样锁定后续单位变更，其编号不能被 `reverse` 冲销。
 - `reverse` → `StockRoom.reverse(original_reference, reference)`，冲销一笔普通出入库流水。保留原流水，追加一条数量相反、编号为 `reference` 的流水，并返回 `code`、`original_reference`、`reference`、`quantity`（冲销数量）与 `balance`（冲销完成时的库存）。冲销作用于当前库存，不回退其间的其他出入库或盘点，也不改写历史盘点数值。
 - `reversals` → `StockRoom.reversals(code)`，按登记顺序返回该物料的冲销对象列表，每项含上述五个字段，`balance` 保留登记时的值；已登记但无冲销的物料返回空列表。
 - `set-minimum` → `StockRoom.set_minimum(code, minimum)`，为已登记物料设置最低库存。`minimum` 为非负整数（不接受布尔、小数、字符串或其他类型）；返回 `code` 与 `minimum`。再次设置覆盖原值，设为零即取消预警。设置不新增出入库流水或任何历史记录，也不占用编号。
