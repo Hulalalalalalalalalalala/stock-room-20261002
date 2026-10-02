@@ -54,6 +54,68 @@ class StockRoom(JsonStore):
         self._write(data)
         return [dict(fields) for fields in records]
 
+    def import_counts_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("\ufeff"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 3 or set(header) != {"code", "counted", "reference"}:
+            raise ValueError("header must contain exactly the code, counted and reference columns")
+        positions = {name: header.index(name) for name in ("code", "counted", "reference")}
+        entries = []
+        seen_codes = set()
+        seen_references = set()
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 3:
+                raise ValueError("each record must have exactly three columns")
+            code = row[positions["code"]].strip()
+            reference = row[positions["reference"]].strip()
+            counted_text = row[positions["counted"]].strip()
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            if not counted_text or any(char < "0" or char > "9" for char in counted_text):
+                raise ValueError("counted must be a nonnegative integer")
+            if code in seen_codes:
+                raise ValueError("material already exists in batch")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            seen_codes.add(code)
+            seen_references.add(reference)
+            entries.append({"code": code, "reference": reference, "counted": int(counted_text)})
+        if not entries:
+            return []
+        data = self._read()
+        materials = data.get("materials", {})
+        existing = data.get("movements", [])
+        parsed = []
+        for entry in entries:
+            code = entry["code"]
+            reference = entry["reference"]
+            counted = entry["counted"]
+            if code not in materials:
+                raise ValueError("unknown material")
+            self._require_unique_reference(data, reference)
+            before = sum(row["quantity"] for row in existing if row["code"] == code)
+            parsed.append({"code": code, "reference": reference, "before": before, "counted": counted, "difference": counted - before})
+        counts = data.setdefault("counts", [])
+        movements = data.setdefault("movements", [])
+        for record in parsed:
+            counts.append(dict(record))
+            if record["difference"] != 0:
+                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return [dict(record) for record in parsed]
+
     def update_material(self, code, name, unit):
         code, name, unit = text(code, "code"), text(name, "name"), text(unit, "unit")
         data = self._read()
