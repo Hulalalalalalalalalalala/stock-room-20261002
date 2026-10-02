@@ -451,108 +451,31 @@ class StockRoom(JsonStore):
         return [dict(row) for row in data.get("purchase_receipts", {}).get(purchase_reference, [])]
 
     def return_purchase(self, receipt_reference, quantity, reference):
-        receipt_reference = text(receipt_reference, "receipt_reference")
-        reference = text(reference, "reference")
-        if type(quantity) is not int or quantity <= 0:
-            raise ValueError("quantity must be a positive integer")
         data = self._read()
-        receipts = data.get("purchase_receipts", {})
-        purchase_reference = None
-        receipt = None
-        for purchase_ref, rows in receipts.items():
-            match = next((row for row in rows if row["reference"] == receipt_reference), None)
-            if match is not None:
-                purchase_reference = purchase_ref
-                receipt = match
-                break
-        if receipt is None:
-            raise ValueError("unknown receipt reference")
-        code = receipt["code"]
-        returned = 0
-        for row in data.get("purchase_returns", {}).get(purchase_reference, []):
-            if row["receipt_reference"] == receipt_reference:
-                returned += row["quantity"]
-        if returned + quantity > receipt["quantity"]:
-            raise ValueError("returned quantity exceeds received quantity")
-        self._require_unique_reference(data, reference)
-        stock = sum(row["quantity"] for row in data.get("movements", []) if row["code"] == code)
-        if stock < quantity:
-            raise ValueError("insufficient stock")
-        balance = stock - quantity
-        data.setdefault("movements", []).append({"code": code, "quantity": -quantity, "reference": reference})
-        record = {
-            "purchase_reference": purchase_reference,
-            "receipt_reference": receipt_reference,
-            "code": code,
-            "quantity": quantity,
-            "reference": reference,
-            "balance": balance,
-        }
-        data.setdefault("purchase_returns", {}).setdefault(purchase_reference, []).append(dict(record))
-        self._write(data)
-        return dict(record)
+        plan = self._plan_purchase_returns(data, [
+            {"receipt_reference": receipt_reference, "quantity": quantity, "reference": reference},
+        ])
+        return self._commit_purchase_returns(data, plan)[0]
 
     def return_purchase_batch(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
         data = self._read()
-        receipts_index = {}
-        for purchase_reference, receipts in data.get("purchase_receipts", {}).items():
-            for receipt in receipts:
-                receipts_index[receipt["reference"]] = (purchase_reference, receipt)
-        returned = {}
-        for records in data.get("purchase_returns", {}).values():
-            for row in records:
-                returned[row["receipt_reference"]] = returned.get(row["receipt_reference"], 0) + row["quantity"]
-        balances = {}
-        seen = set()
-        parsed = []
-        for entry in rows:
-            if not isinstance(entry, dict) or set(entry) != {"receipt_reference", "quantity", "reference"}:
-                raise ValueError("each row must be an object with receipt_reference, quantity and reference")
-            receipt_reference = text(entry["receipt_reference"], "receipt_reference")
-            reference = text(entry["reference"], "reference")
-            quantity = entry["quantity"]
-            if type(quantity) is not int or quantity <= 0:
-                raise ValueError("quantity must be a positive integer")
-            found = receipts_index.get(receipt_reference)
-            if found is None:
-                raise ValueError("unknown receipt reference")
-            purchase_reference, receipt = found
-            code = receipt["code"]
-            total = returned.get(receipt_reference, 0) + quantity
-            if total > receipt["quantity"]:
-                raise ValueError("returned quantity exceeds received quantity")
-            returned[receipt_reference] = total
-            if reference in seen:
-                raise ValueError("reference already exists")
-            self._require_unique_reference(data, reference)
-            if code not in balances:
-                balances[code] = sum(row["quantity"] for row in data.get("movements", []) if row["code"] == code)
-            balances[code] -= quantity
-            if balances[code] < 0:
-                raise ValueError("insufficient stock")
-            seen.add(reference)
-            parsed.append({
-                "purchase_reference": purchase_reference,
-                "receipt_reference": receipt_reference,
-                "code": code,
-                "quantity": quantity,
-                "reference": reference,
-                "balance": balances[code],
-            })
-        movements = data.setdefault("movements", [])
-        returns = data.setdefault("purchase_returns", {})
-        for record in parsed:
-            movements.append({"code": record["code"], "quantity": -record["quantity"], "reference": record["reference"]})
-            returns.setdefault(record["purchase_reference"], []).append(dict(record))
-        self._write(data)
-        return [dict(record) for record in parsed]
+        plan = self._plan_purchase_returns(data, rows)
+        return self._commit_purchase_returns(data, plan)
 
     def preview_purchase_returns(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
         data = self._read()
+        return self._plan_purchase_returns(data, rows)
+
+    def _plan_purchase_returns(self, data, rows):
+        # Shared return rules for the single, batch and preview paths: each
+        # receipt's history plus this batch must stay within the received
+        # quantity, every material's rows share one running stock level that
+        # may not go negative, and new references must be unique within the
+        # batch and against existing movement and count references.
         receipts_index = {}
         for purchase_reference, receipts in data.get("purchase_receipts", {}).items():
             for receipt in receipts:
@@ -563,7 +486,7 @@ class StockRoom(JsonStore):
                 returned[row["receipt_reference"]] = returned.get(row["receipt_reference"], 0) + row["quantity"]
         balances = {}
         seen = set()
-        preview = []
+        plan = []
         for entry in rows:
             if not isinstance(entry, dict) or set(entry) != {"receipt_reference", "quantity", "reference"}:
                 raise ValueError("each row must be an object with receipt_reference, quantity and reference")
@@ -587,11 +510,11 @@ class StockRoom(JsonStore):
             if code not in balances:
                 balances[code] = sum(row["quantity"] for row in data.get("movements", []) if row["code"] == code)
             before = balances[code]
-            balances[code] -= quantity
+            balances[code] = before - quantity
             if balances[code] < 0:
                 raise ValueError("insufficient stock")
             seen.add(reference)
-            preview.append({
+            plan.append({
                 "purchase_reference": purchase_reference,
                 "receipt_reference": receipt_reference,
                 "code": code,
@@ -601,7 +524,26 @@ class StockRoom(JsonStore):
                 "balance": balances[code],
                 "receipt_remaining": receipt["quantity"] - total,
             })
-        return preview
+        return plan
+
+    def _commit_purchase_returns(self, data, plan):
+        movements = data.setdefault("movements", [])
+        returns = data.setdefault("purchase_returns", {})
+        records = []
+        for row in plan:
+            record = {
+                "purchase_reference": row["purchase_reference"],
+                "receipt_reference": row["receipt_reference"],
+                "code": row["code"],
+                "quantity": row["quantity"],
+                "reference": row["reference"],
+                "balance": row["balance"],
+            }
+            movements.append({"code": row["code"], "quantity": -row["quantity"], "reference": row["reference"]})
+            returns.setdefault(row["purchase_reference"], []).append(record)
+            records.append(dict(record))
+        self._write(data)
+        return records
 
     def purchase_returns(self, purchase_reference):
         purchase_reference = text(purchase_reference, "purchase_reference")
