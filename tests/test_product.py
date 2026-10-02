@@ -2870,5 +2870,199 @@ class PurchaseOrdersTests(unittest.TestCase):
         self.assertFalse((empty / "data.json").exists())
 
 
+class ReplenishmentPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.set_minimum("BOX", 10)
+        self.app.set_minimum("PAPER", 5)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        # BOX: ordered 7 on an open order, 3 received then 1 returned;
+        # a cancelled order still shows 20 unreceived.
+        self.app.create_purchase("PO-1", "北方", [{"code": "BOX", "quantity": 7}])
+        self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 3, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 1, "RET-1")
+        self.app.create_purchase("PO-2", "南方", [{"code": "BOX", "quantity": 20}])
+        self.app.cancel_purchase("PO-2")
+
+    def test_fixed_sample_survives_reopen(self):
+        self.seed_fixed_sample()
+        expected = [{
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 2, "minimum": 10,
+            "shortage": 8, "incoming": 4, "suggested": 4,
+            "purchases": [{"reference": "PO-1", "supplier": "北方", "remaining": 4}],
+        }, {
+            "code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 0, "minimum": 5,
+            "shortage": 5, "incoming": 0, "suggested": 5, "purchases": [],
+        }]
+        self.assertEqual(self.app.replenishment_plan(), expected)
+        self.assertEqual(StockRoom(self.root).replenishment_plan(), expected)
+
+    def test_only_active_materials_below_minimum_included(self):
+        self.app.movement("PAPER", 5, "IN-1")
+        self.assertEqual([item["code"] for item in self.app.replenishment_plan()], ["BOX"])
+        self.app.set_active("BOX", False)
+        self.assertEqual(self.app.replenishment_plan(), [])
+
+    def test_keyword_is_trimmed_literal_and_case_sensitive(self):
+        self.assertEqual(len(self.app.replenishment_plan(keyword="  纸  ")), 2)
+        self.assertEqual([i["code"] for i in self.app.replenishment_plan(keyword="BOX")], ["BOX"])
+        self.assertEqual(self.app.replenishment_plan(keyword="box"), [])
+        self.assertEqual(self.app.replenishment_plan(keyword=".*"), [])
+        self.assertEqual(self.app.replenishment_plan(), self.app.replenishment_plan(keyword=""))
+
+    def test_sorted_by_unicode_code_points(self):
+        self.app.register("纸张", "A4纸", "张")
+        self.app.set_minimum("纸张", 1)
+        self.assertEqual([i["code"] for i in self.app.replenishment_plan()], ["BOX", "PAPER", "纸张"])
+
+    def test_incoming_sums_open_orders_and_fully_received_rows_excluded(self):
+        self.app.create_purchase("PO-2", "南方", [{"code": "BOX", "quantity": 3}])
+        self.app.create_purchase("PO-10", "北方", [{"code": "BOX", "quantity": 5}])
+        self.app.receive_purchase("PO-10", [{"code": "BOX", "quantity": 2, "reference": "RCV-1"}])
+        self.app.create_purchase("PO-1", "北方", [{"code": "BOX", "quantity": 4}])
+        self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 4, "reference": "RCV-2"}])
+        item = self.app.replenishment_plan(keyword="BOX")[0]
+        self.assertEqual(item["quantity"], 6)
+        self.assertEqual(item["incoming"], 6)
+        self.assertEqual(item["suggested"], 0)
+        self.assertEqual(item["purchases"], [
+            {"reference": "PO-10", "supplier": "北方", "remaining": 3},
+            {"reference": "PO-2", "supplier": "南方", "remaining": 3},
+        ])
+
+    def test_zero_suggested_shortage_still_listed(self):
+        self.app.create_purchase("PO-1", "北方", [{"code": "BOX", "quantity": 20}])
+        item = self.app.replenishment_plan(keyword="BOX")[0]
+        self.assertEqual((item["shortage"], item["incoming"], item["suggested"]), (10, 20, 0))
+
+    def test_movements_counts_and_reversals_only_affect_stock(self):
+        self.app.create_purchase("PO-1", "北方", [{"code": "BOX", "quantity": 6}])
+        self.app.movement("BOX", 4, "IN-1")
+        self.app.movement("BOX", -1, "OUT-1")
+        self.app.count("BOX", 8, "CNT-1")
+        self.app.reverse("OUT-1", "REV-1")
+        item = self.app.replenishment_plan(keyword="BOX")[0]
+        self.assertEqual((item["quantity"], item["shortage"], item["incoming"], item["suggested"]), (9, 1, 6, 0))
+
+    def test_unit_snapshot_mismatch_raises_for_whole_query(self):
+        self.app.create_purchase("PO-1", "北方", [{"code": "BOX", "quantity": 7}])
+        self.app.update_material("BOX", "纸箱", "只")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.replenishment_plan()
+        with self.assertRaises(ValueError):
+            self.app.replenishment_plan(keyword="BOX")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Materials filtered out by the keyword do not trigger the error.
+        self.assertEqual([i["code"] for i in self.app.replenishment_plan(keyword="PAPER")], ["PAPER"])
+
+    def test_cancelled_and_fully_received_rows_do_not_trigger_unit_error(self):
+        self.app.create_purchase("PO-1", "北方", [{"code": "BOX", "quantity": 7}])
+        self.app.create_purchase("PO-2", "南方", [{"code": "BOX", "quantity": 3}])
+        self.app.receive_purchase("PO-2", [{"code": "BOX", "quantity": 3, "reference": "RCV-1"}])
+        self.app.cancel_purchase("PO-1")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["materials"]["BOX"]["unit"] = "只"
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        item = StockRoom(self.root).replenishment_plan(keyword="BOX")[0]
+        self.assertEqual((item["unit"], item["incoming"], item["purchases"]), ("只", 0, []))
+
+    def test_invalid_keyword_rejected_even_without_data(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        for keyword in (None, 1, True, 1.5, ["纸"], {"k": "纸"}):
+            with self.subTest(keyword=keyword):
+                with self.assertRaises(ValueError):
+                    app.replenishment_plan(keyword=keyword)
+                with self.assertRaises(ValueError):
+                    self.app.replenishment_plan(keyword=keyword)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_query_is_read_only_and_empty_directory_creates_no_file(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        self.app.replenishment_plan()
+        self.app.replenishment_plan(keyword="箱")
+        with self.assertRaises(ValueError):
+            self.app.replenishment_plan(keyword=1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.replenishment_plan(), [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_defaults(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({
+            "materials": {"BOX": {"code": "BOX", "name": "纸箱", "unit": "个"}},
+        }, ensure_ascii=False), encoding="utf-8")
+        app = StockRoom(legacy)
+        self.assertEqual(app.replenishment_plan(), [])
+        (legacy / "data.json").write_text(json.dumps({
+            "materials": {"BOX": {"code": "BOX", "name": "纸箱", "unit": "个"}},
+            "minimums": {"BOX": 4},
+            "purchases": [{"reference": "PO-1", "supplier": "北方", "status": "open",
+                           "rows": [{"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 3}]}],
+        }, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(app.replenishment_plan(), [{
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 0, "minimum": 4,
+            "shortage": 4, "incoming": 3, "suggested": 1,
+            "purchases": [{"reference": "PO-1", "supplier": "北方", "remaining": 3}],
+        }])
+
+    def test_returns_do_not_restore_incoming(self):
+        self.seed_fixed_sample()
+        item = self.app.replenishment_plan(keyword="BOX")[0]
+        self.assertEqual((item["quantity"], item["incoming"]), (2, 4))
+        self.app.return_purchase("RCV-1", 2, "RET-2")
+        item = self.app.replenishment_plan(keyword="BOX")[0]
+        self.assertEqual((item["quantity"], item["incoming"], item["suggested"]), (0, 4, 6))
+
+    def test_cli_omitted_object_array_and_errors(self):
+        self.seed_fixed_sample()
+        result = self.run_cli("replenishment-plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([item["code"] for item in value], ["BOX", "PAPER"])
+        self.assertEqual(value[0]["incoming"], 4)
+        self.assertEqual(value[0]["purchases"], [{"reference": "PO-1", "supplier": "北方", "remaining": 4}])
+        payload = self.write_payload("plan.json", {"keyword": " 箱 "})
+        result = self.run_cli("replenishment-plan", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["code"] for item in json.loads(result.stdout)], ["BOX"])
+        array_payload = self.write_payload("plans.json", [{}, {"keyword": "box"}])
+        result = self.run_cli("replenishment-plan", array_payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([len(row) for row in json.loads(result.stdout)], [2, 0])
+        bad = self.write_payload("bad.json", {"keyword": 11})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("replenishment-plan", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = self.root / "cli-empty"
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(empty), "replenishment-plan"],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [])
+        self.assertFalse((empty / "data.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
