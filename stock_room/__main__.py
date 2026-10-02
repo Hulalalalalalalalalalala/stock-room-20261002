@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import StockRoom
 
-ACTIONS = {'register': 'register', 'import-materials-csv': 'import_materials_csv', 'update-material': 'update_material', 'move': 'movement', 'move-batch': 'movement_batch', 'stock': 'stock', 'history': 'history', 'count': 'count', 'count-batch': 'count_batch', 'counts': 'counts', 'reverse': 'reverse', 'reversals': 'reversals', 'set-minimum': 'set_minimum', 'shortages': 'shortages', 'inventory': 'inventory', 'export-inventory-csv': 'export_inventory_csv', 'set-active': 'set_active', 'material-status': 'material_status', 'create-purchase': 'create_purchase', 'purchase-order': 'purchase_order', 'cancel-purchase': 'cancel_purchase', 'receive-purchase': 'receive_purchase', 'purchase-receipts': 'purchase_receipts'}
+ACTIONS = {'register': 'register', 'import-materials-csv': 'import_materials_csv', 'update-material': 'update_material', 'move': 'movement', 'move-batch': 'movement_batch', 'stock': 'stock', 'history': 'history', 'count': 'count', 'count-batch': 'count_batch', 'counts': 'counts', 'reverse': 'reverse', 'reversals': 'reversals', 'set-minimum': 'set_minimum', 'shortages': 'shortages', 'inventory': 'inventory', 'export-inventory-csv': 'export_inventory_csv', 'set-active': 'set_active', 'material-status': 'material_status', 'create-purchase': 'create_purchase', 'purchase-order': 'purchase_order', 'cancel-purchase': 'cancel_purchase', 'receive-purchase': 'receive_purchase', 'purchase-receipts': 'purchase_receipts', 'return-purchase': 'return_purchase', 'purchase-returns': 'purchase_returns'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))
