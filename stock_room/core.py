@@ -236,6 +236,67 @@ class StockRoom(JsonStore):
             raise ValueError("unknown material")
         return [dict(row) for row in data.get("reversals", []) if row["code"] == code]
 
+    def create_purchase(self, reference, supplier, rows):
+        reference = text(reference, "reference")
+        supplier = text(supplier, "supplier")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        if any(order["reference"] == reference for order in data.get("purchases", [])):
+            raise ValueError("reference already exists")
+        seen = set()
+        parsed = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "quantity"}:
+                raise ValueError("each row must be an object with code and quantity")
+            code = text(entry["code"], "code")
+            quantity = entry["quantity"]
+            if type(quantity) is not int or quantity <= 0:
+                raise ValueError("quantity must be a positive integer")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+            if code in seen:
+                raise ValueError("material already exists in purchase")
+            seen.add(code)
+            material = materials[code]
+            parsed.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity})
+        order = {"reference": reference, "supplier": supplier, "status": "open", "rows": parsed}
+        data.setdefault("purchases", []).append(order)
+        self._write(data)
+        return self._purchase_snapshot(order)
+
+    def purchase_order(self, reference):
+        reference = text(reference, "reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        return self._purchase_snapshot(order)
+
+    def cancel_purchase(self, reference):
+        reference = text(reference, "reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        if order["status"] != "cancelled":
+            order["status"] = "cancelled"
+            self._write(data)
+        return self._purchase_snapshot(order)
+
+    @staticmethod
+    def _purchase_snapshot(order):
+        return {
+            "reference": order["reference"],
+            "supplier": order["supplier"],
+            "status": order["status"],
+            "rows": [dict(row) for row in order["rows"]],
+        }
+
     def set_active(self, code, active):
         code = text(code, "code")
         if type(active) is not bool:
