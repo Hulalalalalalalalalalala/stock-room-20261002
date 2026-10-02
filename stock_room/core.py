@@ -409,6 +409,41 @@ class StockRoom(JsonStore):
             raise ValueError("unknown purchase reference")
         return [dict(row) for row in data.get("purchase_returns", {}).get(purchase_reference, [])]
 
+    def purchase_progress(self, purchase_reference):
+        purchase_reference = text(purchase_reference, "purchase_reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        received = self._received_totals(data, purchase_reference)
+        returned = {}
+        for row in data.get("purchase_returns", {}).get(purchase_reference, []):
+            returned[row["code"]] = returned.get(row["code"], 0) + row["quantity"]
+        rows = []
+        for row in order["rows"]:
+            got = received.get(row["code"], 0)
+            back = returned.get(row["code"], 0)
+            rows.append({
+                **row,
+                "received": got,
+                "returned": back,
+                "net_received": got - back,
+                "remaining": row["quantity"] - got,
+            })
+        if all(row["received"] == 0 for row in rows):
+            progress = "pending"
+        elif all(row["received"] == row["quantity"] for row in rows):
+            progress = "complete"
+        else:
+            progress = "partial"
+        return {
+            "reference": order["reference"],
+            "supplier": order["supplier"],
+            "status": order["status"],
+            "progress": progress,
+            "rows": rows,
+        }
+
     @staticmethod
     def _received_totals(data, purchase_reference):
         totals = {}
