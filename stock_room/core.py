@@ -18,6 +18,8 @@ class StockRoom(JsonStore):
         data = self._read()
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
+        if not data.get("status", {}).get(code, True):
+            raise ValueError("material is inactive")
         rows = data.setdefault("movements", [])
         self._require_unique_reference(data, reference)
         stock = sum(row["quantity"] for row in rows if row["code"] == code)
@@ -33,6 +35,7 @@ class StockRoom(JsonStore):
             raise ValueError("rows must be a nonempty list")
         data = self._read()
         materials = data.get("materials", {})
+        status = data.get("status", {})
         existing = data.get("movements", [])
         balances = {}
         seen = set()
@@ -47,6 +50,8 @@ class StockRoom(JsonStore):
                 raise ValueError("quantity must be a nonzero integer")
             if code not in materials:
                 raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
             if reference in seen:
                 raise ValueError("reference already exists")
             self._require_unique_reference(data, reference)
@@ -132,6 +137,24 @@ class StockRoom(JsonStore):
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
         return [dict(row) for row in data.get("reversals", []) if row["code"] == code]
+
+    def set_active(self, code, active):
+        code = text(code, "code")
+        if type(active) is not bool:
+            raise ValueError("active must be a boolean")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        data.setdefault("status", {})[code] = active
+        self._write(data)
+        return {"code": code, "active": active}
+
+    def material_status(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return {"code": code, "active": data.get("status", {}).get(code, True)}
 
     def set_minimum(self, code, minimum):
         code = text(code, "code")

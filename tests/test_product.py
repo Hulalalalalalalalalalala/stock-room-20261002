@@ -626,5 +626,174 @@ class MovementBatchTests(unittest.TestCase):
         self.assertEqual([row["reference"] for row in self.app.history("PAPER")][-1], "B-ONE")
 
 
+class ActiveStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_new_and_legacy_materials_default_active(self):
+        self.assertEqual(self.app.material_status("PAPER"), {"code": "PAPER", "active": True})
+        self.assertEqual(self.app.material_status("BOX"), {"code": "BOX", "active": True})
+
+    def test_fixed_sample_deactivate_rejects_movements_then_count_reverse_resume(self):
+        self.assertEqual(self.app.set_active("PAPER", False), {"code": "PAPER", "active": False})
+        self.assertEqual(self.app.material_status("PAPER"), {"code": "PAPER", "active": False})
+        before = self.app.path.read_bytes()
+        for quantity, reference in ((1, "IN-002"), (-1, "OUT-002")):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.movement("PAPER", quantity, reference)
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([
+                {"code": "BOX", "quantity": 3, "reference": "B-BOX-IN"},
+                {"code": "PAPER", "quantity": -1, "reference": "B-PAPER-OUT"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(self.app.history("BOX"), [])
+        self.app.count("PAPER", 11, "CNT-001")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
+        self.app.reverse("OUT-001", "REV-OUT")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 17)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.material_status("PAPER"), {"code": "PAPER", "active": False})
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 17)
+        reopened.set_active("PAPER", True)
+        record = reopened.movement("PAPER", 1, "IN-002")
+        self.assertEqual(record["balance"], 18)
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 18)
+        self.assertEqual(StockRoom(self.root).stock("BOX")["quantity"], 0)
+
+    def test_repeat_same_state_returns_original_state(self):
+        self.assertEqual(self.app.set_active("PAPER", False), {"code": "PAPER", "active": False})
+        self.assertEqual(self.app.set_active("PAPER", False), {"code": "PAPER", "active": False})
+        self.assertEqual(self.app.set_active("PAPER", True), {"code": "PAPER", "active": True})
+        self.assertEqual(self.app.set_active("PAPER", True), {"code": "PAPER", "active": True})
+
+    def test_status_change_creates_no_movement_or_history(self):
+        self.app.set_active("PAPER", False)
+        self.app.set_active("PAPER", True)
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001", "OUT-001"])
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_batch_with_inactive_material_rejects_entire_batch(self):
+        self.app.set_active("PAPER", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([{"code": "PAPER", "quantity": 1, "reference": "B-PAPER-IN"}])
+        with self.assertRaises(ValueError):
+            self.app.movement_batch([
+                {"code": "BOX", "quantity": 3, "reference": "B-BOX-IN"},
+                {"code": "PAPER", "quantity": -1, "reference": "B-PAPER-OUT"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(StockRoom(self.root).stock("BOX")["quantity"], 0)
+
+    def test_count_and_reverse_still_apply_to_inactive_material(self):
+        self.app.set_active("PAPER", False)
+        self.app.count("PAPER", 11, "CNT-001")
+        record = self.app.reverse("OUT-001", "REV-OUT")
+        self.assertEqual((record["quantity"], record["balance"]), (6, 17))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 17)
+
+    def test_status_code_is_stripped_and_case_sensitive(self):
+        self.assertEqual(self.app.set_active("  PAPER  ", False)["code"], "PAPER")
+        self.assertEqual(self.app.material_status("  PAPER  ")["active"], False)
+        with self.assertRaises(ValueError):
+            self.app.set_active("paper", True)
+        with self.assertRaises(ValueError):
+            self.app.material_status("paper")
+
+    def test_invalid_status_arguments_rejected(self):
+        for code in ("", "   ", 11, None, "UNKNOWN"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.set_active(code, False)
+                with self.assertRaises(ValueError):
+                    self.app.material_status(code)
+        for active in (1, 0, "false", None, 1.0, [False]):
+            with self.subTest(active=active):
+                with self.assertRaises(ValueError):
+                    self.app.set_active("PAPER", active)
+
+    def test_failed_status_change_preserves_everything(self):
+        self.app.set_minimum("BOX", 2)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.set_active("PAPER", 1)
+        with self.assertRaises(ValueError):
+            self.app.set_active("UNKNOWN", False)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.material_status("PAPER")["active"], True)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+
+    def test_status_query_does_not_modify_file(self):
+        before = self.app.path.read_bytes()
+        self.app.material_status("PAPER")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_status_calls_on_empty_directory_create_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.set_active("PAPER", False)
+        with self.assertRaises(ValueError):
+            app.set_active(11, False)
+        with self.assertRaises(ValueError):
+            app.material_status("PAPER")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_resumed_movement_keeps_existing_validations(self):
+        self.app.set_active("PAPER", False)
+        with self.assertRaises(ValueError):
+            self.app.movement("PAPER", -100, "OUT-BAD")
+        self.app.set_active("PAPER", True)
+        with self.assertRaises(ValueError):
+            self.app.movement("PAPER", -100, "OUT-BAD")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_cli_set_active_and_material_status(self):
+        payload = self.root / "active.json"
+        payload.write_text(json.dumps({"code": "PAPER", "active": False}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-active", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"code": "PAPER", "active": False})
+        query = self.root / "query.json"
+        query.write_text(json.dumps({"code": "PAPER"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "material-status", str(query)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"code": "PAPER", "active": False})
+
+    def test_cli_set_active_invalid_argument_returns_2(self):
+        payload = self.root / "bad-active.json"
+        payload.write_text(json.dumps({"code": "PAPER", "active": "false"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-active", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.material_status("PAPER")["active"], True)
+
+    def test_cli_set_active_array_keeps_earlier_success(self):
+        payload = self.root / "active-batch.json"
+        payload.write_text(json.dumps([
+            {"code": "BOX", "active": False},
+            {"code": "PAPER", "active": 1},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-active", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+        self.assertEqual(self.app.material_status("PAPER")["active"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

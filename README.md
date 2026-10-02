@@ -33,6 +33,8 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `reverse` → `StockRoom.reverse(original_reference, reference)`，冲销一笔普通出入库流水。保留原流水，追加一条数量相反、编号为 `reference` 的流水，并返回 `code`、`original_reference`、`reference`、`quantity`（冲销数量）与 `balance`（冲销完成时的库存）。冲销作用于当前库存，不回退其间的其他出入库或盘点，也不改写历史盘点数值。
 - `reversals` → `StockRoom.reversals(code)`，按登记顺序返回该物料的冲销对象列表，每项含上述五个字段，`balance` 保留登记时的值；已登记但无冲销的物料返回空列表。
 - `set-minimum` → `StockRoom.set_minimum(code, minimum)`，为已登记物料设置最低库存。`minimum` 为非负整数（不接受布尔、小数、字符串或其他类型）；返回 `code` 与 `minimum`。再次设置覆盖原值，设为零即取消预警。设置不新增出入库流水或任何历史记录，也不占用编号。
+- `set-active` → `StockRoom.set_active(code, active)`，停用或恢复已登记物料。`active` 只接受布尔值（不接受整数、字符串或其他类型）；返回 `code` 与 `active`。停用不要求库存为零，不改变库存与任何历史；重复设置同一状态成功返回原状态。状态切换不产生流水或历史、不占用编号。停用后普通出入库（`move` 与 `move-batch`，无论数量正负）一律抛出 `ValueError`；`move-batch` 只要包含停用物料即整批拒绝，不保存其他合法行、不占用编号。盘点（`count`）与冲销（`reverse`）仍按既有规则处理停用物料，全部查询入口语义不变。恢复后普通出入库继续遵守已有校验。
+- `material-status` → `StockRoom.material_status(code)`，返回 `code` 与 `active`。新登记物料及旧数据中未设置状态的物料均视为启用（`active` 为 `true`）。查询不改写文件，也不为尚无数据的目录创建文件。
 - `shortages` → `StockRoom.shortages()`，无参数，可省略输入文件。返回缺料物料对象列表，每项含 `code`、`name`、`unit`、`quantity`（当前台账库存）、`minimum` 与 `shortage`（`minimum` 减 `quantity`）。未设置最低库存的物料按零处理；仅库存严格小于最低库存的物料进入结果，按 `code` 的 Unicode 码点逐字符升序排列。没有缺料或尚未登记物料时返回空列表。查询不改写文件，也不为尚无数据的目录创建文件。
 
 `code` 与盘点 `reference` 只接受去除首尾空白后的非空字符串，编码区分大小写；`counted` 必须是非负整数（不接受布尔、小数或其他类型），否则抛出 `ValueError`。盘点编号与全部物料的出入库编号共用唯一范围，重复编号抛出 `ValueError`；普通出入库也不能复用零差异盘点占用的编号。校验失败时 `data.json`、库存及两类历史均保持不变。
@@ -40,6 +42,8 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 冲销的 `original_reference` 与 `reference` 同样只接受去除首尾空白后的非空字符串并区分大小写。原编号不存在、指向盘点（含零差异盘点）或冲销记录、或该笔流水已被成功冲销，新编号与任一物料的流水或盘点编号重复，以及冲销后库存为负，均抛出 `ValueError`；查询未知物料的冲销列表也抛出 `ValueError`。每笔普通流水最多成功冲销一次。拒绝操作后 `data.json`、库存和全部历史保持不变，不新增编号占用。冲销关联保存在 `root/data.json` 中，重新打开同一目录仍可查询。
 
 最低库存的 `code` 同样去除首尾空白后匹配并区分大小写；编码不是非空字符串、物料不存在或 `minimum` 不是非负整数时抛出 `ValueError`，此时 `data.json` 与全部业务查询结果保持不变，不占用流水编号。最低库存保存在 `root/data.json` 中，重新打开同一目录仍生效；旧数据目录无需补写配置即可直接查询缺料清单，后续出入库、盘点和冲销按最新库存影响清单。
+
+停用状态的 `code` 同样去除首尾空白后匹配并区分大小写；编码不是非空字符串、物料不存在或 `active` 不是布尔值时抛出 `ValueError`，此时 `data.json` 的字节、库存、状态、最低库存配置及全部历史保持原样，不占用流水编号。停用物料的普通出入库无论数量正负均抛出 `ValueError`；批量出入库遇到停用物料时整批拒绝，其他合法行也不保存。状态保存在 `root/data.json` 中，重新打开同一目录仍生效，状态查询不写文件。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
