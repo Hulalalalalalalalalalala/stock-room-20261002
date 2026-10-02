@@ -415,8 +415,35 @@ class StockRoom(JsonStore):
         order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
         if order is None:
             raise ValueError("unknown purchase reference")
-        received = self._received_totals(data, purchase_reference)
-        returned = self._returned_totals(data, purchase_reference)
+        return self._purchase_progress(data, order)
+
+    def purchase_orders(self, supplier="", status=None, progress=None):
+        if not isinstance(supplier, str):
+            raise ValueError("supplier must be a string")
+        if status is not None and status not in ("open", "cancelled"):
+            raise ValueError("status must be null, open or cancelled")
+        if progress is not None and progress not in ("pending", "partial", "complete"):
+            raise ValueError("progress must be null, pending, partial or complete")
+        supplier = supplier.strip()
+        data = self._read()
+        items = []
+        for order in data.get("purchases", []):
+            if supplier and supplier not in order["supplier"]:
+                continue
+            if status is not None and order["status"] != status:
+                continue
+            snapshot = self._purchase_progress(data, order)
+            if progress is not None and snapshot["progress"] != progress:
+                continue
+            items.append(snapshot)
+        items.sort(key=lambda item: item["reference"])
+        return items
+
+    @classmethod
+    def _purchase_progress(cls, data, order):
+        purchase_reference = order["reference"]
+        received = cls._received_totals(data, purchase_reference)
+        returned = cls._returned_totals(data, purchase_reference)
         rows = []
         all_pending = True
         all_complete = True

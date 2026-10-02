@@ -2479,5 +2479,126 @@ class PurchaseProgressTests(unittest.TestCase):
         self.assertEqual(self.app.path.read_bytes(), before)
 
 
+class PurchaseOrdersTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.create_purchase("PO-B", "北方", [{"code": "PAPER", "quantity": 10}])
+        self.app.create_purchase("PO-A", "南方", [{"code": "PAPER", "quantity": 2}])
+        self.app.receive_purchase("PO-B", [{"code": "PAPER", "quantity": 6, "reference": "RCV-B-1"}])
+        self.app.return_purchase("RCV-B-1", 2, "RET-B-1")
+        self.app.receive_purchase("PO-A", [{"code": "PAPER", "quantity": 2, "reference": "RCV-A-1"}])
+        self.app.return_purchase("RCV-A-1", 2, "RET-A-1")
+        self.app.cancel_purchase("PO-A")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def test_fixed_sample_default_order_and_combined_filters(self):
+        items = self.app.purchase_orders()
+        self.assertEqual([item["reference"] for item in items], ["PO-A", "PO-B"])
+        self.assertEqual(items[0], self.app.purchase_progress("PO-A"))
+        self.assertEqual(items[1], self.app.purchase_progress("PO-B"))
+        self.assertEqual(items[0]["status"], "cancelled")
+        self.assertEqual(items[0]["progress"], "complete")
+        items = self.app.purchase_orders(supplier="北", status="open", progress="partial")
+        self.assertEqual([item["reference"] for item in items], ["PO-B"])
+        row = items[0]["rows"][0]
+        self.assertEqual((row["received"], row["returned"], row["net_received"], row["remaining"]),
+                         (6, 2, 4, 4))
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["reference"] for item in reopened.purchase_orders()], ["PO-A", "PO-B"])
+        self.assertEqual(reopened.purchase_orders(supplier="北", status="open", progress="partial"), items)
+
+    def test_supplier_is_trimmed_case_sensitive_substring(self):
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(supplier=" 北 ")], ["PO-B"])
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(supplier="方")], ["PO-A", "PO-B"])
+        self.assertEqual(self.app.purchase_orders(supplier="bei"), [])
+        self.assertEqual(self.app.purchase_orders(supplier="  "), self.app.purchase_orders())
+
+    def test_status_and_progress_filter_independently(self):
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(status="cancelled")], ["PO-A"])
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(status="open")], ["PO-B"])
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(progress="complete")], ["PO-A"])
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(progress="partial")], ["PO-B"])
+        self.assertEqual(self.app.purchase_orders(progress="pending"), [])
+        self.assertEqual(self.app.purchase_orders(status="cancelled", progress="partial"), [])
+
+    def test_invalid_filters_raise_even_without_data(self):
+        empty = StockRoom(self.root / "empty")
+        for app in (self.app, empty):
+            for supplier in (None, 1, True, []):
+                with self.assertRaises(ValueError):
+                    app.purchase_orders(supplier=supplier)
+            for status in ("pending", "Open", 1, True, ""):
+                with self.assertRaises(ValueError):
+                    app.purchase_orders(status=status)
+            for progress in ("open", "Partial", 1, True, ""):
+                with self.assertRaises(ValueError):
+                    app.purchase_orders(progress=progress)
+        self.assertEqual(empty.purchase_orders(), [])
+        self.assertFalse((self.root / "empty" / "data.json").exists())
+
+    def test_no_match_returns_empty_and_query_is_read_only(self):
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.purchase_orders(supplier="不存在"), [])
+        self.app.purchase_orders()
+        with self.assertRaises(ValueError):
+            self.app.purchase_orders(status="bogus")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_legacy_data_without_purchases_behaves_as_empty(self):
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchases", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(StockRoom(self.root).purchase_orders(), [])
+
+    def test_movements_counts_reversals_and_rename_do_not_affect_stats(self):
+        self.app.movement("PAPER", 5, "IN-1")
+        self.app.count("PAPER", 9, "CNT-1")
+        self.app.reverse("IN-1", "REV-1")
+        self.app.update_material("PAPER", "新名称", "张")
+        self.app.set_active("PAPER", False)
+        items = self.app.purchase_orders(supplier="北", status="open", progress="partial")
+        self.assertEqual([item["reference"] for item in items], ["PO-B"])
+        row = items[0]["rows"][0]
+        self.assertEqual((row["name"], row["received"], row["returned"], row["net_received"], row["remaining"]),
+                         ("包装纸", 6, 2, 4, 4))
+
+    def test_cli_object_array_and_default_query(self):
+        result = self.run_cli("purchase-orders")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["reference"] for item in json.loads(result.stdout)], ["PO-A", "PO-B"])
+        payload = self.write_payload("query.json", {"supplier": "北", "status": "open", "progress": "partial"})
+        result = self.run_cli("purchase-orders", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([item["reference"] for item in value], ["PO-B"])
+        self.assertEqual(value[0]["rows"][0]["net_received"], 4)
+        array_payload = self.write_payload("queries.json", [{"supplier": "北"}, {"supplier": "南"}, {}])
+        result = self.run_cli("purchase-orders", array_payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([[item["reference"] for item in row] for row in value],
+                         [["PO-B"], ["PO-A"], ["PO-A", "PO-B"]])
+
+    def test_cli_failure_preserves_file(self):
+        payload = self.write_payload("bad.json", {"progress": "bogus"})
+        before = self.app.path.read_bytes()
+        result = self.run_cli("purchase-orders", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
