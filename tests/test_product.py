@@ -2870,5 +2870,160 @@ class PurchaseOrdersTests(unittest.TestCase):
         self.assertFalse((empty / "data.json").exists())
 
 
+class MovementLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("A", "物料A", "个")
+
+    def seed_fixed_sample(self):
+        self.app.movement("A", 10, "M1")
+        self.app.movement("A", -2, "M2")
+        self.app.reverse("M2", "R1")
+        self.app.create_purchase("P1", "S", [{"code": "A", "quantity": 4}])
+        self.app.receive_purchase("P1", [{"code": "A", "quantity": 4, "reference": "IN1"}])
+        self.app.count("A", 12, "C1")
+        self.app.return_purchase("IN1", 1, "RET1")
+
+    def test_fixed_sample_survives_reopen(self):
+        self.seed_fixed_sample()
+        expected = [
+            {"code": "A", "quantity": 10, "reference": "M1", "before": 0, "balance": 10,
+             "kind": "movement", "purchase_reference": None, "related_reference": None},
+            {"code": "A", "quantity": -2, "reference": "M2", "before": 10, "balance": 8,
+             "kind": "movement", "purchase_reference": None, "related_reference": None},
+            {"code": "A", "quantity": 2, "reference": "R1", "before": 8, "balance": 10,
+             "kind": "reversal", "purchase_reference": None, "related_reference": "M2"},
+            {"code": "A", "quantity": 4, "reference": "IN1", "before": 10, "balance": 14,
+             "kind": "purchase_receipt", "purchase_reference": "P1", "related_reference": None},
+            {"code": "A", "quantity": -2, "reference": "C1", "before": 14, "balance": 12,
+             "kind": "count", "purchase_reference": None, "related_reference": None},
+            {"code": "A", "quantity": -1, "reference": "RET1", "before": 12, "balance": 11,
+             "kind": "purchase_return", "purchase_reference": "P1", "related_reference": "IN1"},
+        ]
+        self.assertEqual(self.app.movement_ledger("A"), expected)
+        self.assertEqual(StockRoom(self.root).movement_ledger("A"), expected)
+
+    def test_kind_filter_keeps_running_balances(self):
+        self.seed_fixed_sample()
+        self.assertEqual(self.app.movement_ledger("A", kind="purchase_return"), [
+            {"code": "A", "quantity": -1, "reference": "RET1", "before": 12, "balance": 11,
+             "kind": "purchase_return", "purchase_reference": "P1", "related_reference": "IN1"},
+        ])
+        self.assertEqual([row["reference"] for row in self.app.movement_ledger("A", kind="movement")], ["M1", "M2"])
+        self.assertEqual([row["balance"] for row in self.app.movement_ledger("A", kind="reversal")], [10])
+        self.assertEqual([row["balance"] for row in self.app.movement_ledger("A", kind="purchase_receipt")], [14])
+        self.assertEqual([row["balance"] for row in self.app.movement_ledger("A", kind="count")], [12])
+
+    def test_zero_difference_count_and_unmatched_kind_absent(self):
+        self.seed_fixed_sample()
+        self.app.count("A", 11, "C-ZERO")
+        self.assertEqual([row["reference"] for row in self.app.movement_ledger("A")],
+                         ["M1", "M2", "R1", "IN1", "C1", "RET1"])
+        self.assertEqual(self.app.movement_ledger("A", kind="count"), [
+            {"code": "A", "quantity": -2, "reference": "C1", "before": 14, "balance": 12,
+             "kind": "count", "purchase_reference": None, "related_reference": None},
+        ])
+
+    def test_empty_for_registered_material_without_movements(self):
+        self.assertEqual(self.app.movement_ledger("A"), [])
+        self.assertEqual(self.app.movement_ledger("A", kind="count"), [])
+
+    def test_inactive_material_still_queryable(self):
+        self.seed_fixed_sample()
+        self.app.set_active("A", False)
+        self.assertEqual(len(self.app.movement_ledger("A")), 6)
+
+    def test_code_is_stripped_and_case_sensitive(self):
+        self.app.movement("A", 3, "M1")
+        self.assertEqual(len(self.app.movement_ledger("  A  ")), 1)
+        with self.assertRaises(ValueError):
+            self.app.movement_ledger("a")
+
+    def test_invalid_arguments_rejected(self):
+        for code in ("", "   ", 11, None, "UNKNOWN"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.movement_ledger(code)
+        for kind in ("MOVEMENT", " purchase_return ", "", 11, True, ["movement"]):
+            with self.subTest(kind=kind):
+                with self.assertRaises(ValueError):
+                    self.app.movement_ledger("A", kind=kind)
+
+    def test_legacy_rows_without_associations_are_movements(self):
+        self.app.path.parent.mkdir(parents=True, exist_ok=True)
+        self.app.path.write_text(json.dumps({
+            "materials": {"A": {"code": "A", "name": "物料A", "unit": "个"}},
+            "movements": [
+                {"code": "A", "quantity": 5, "reference": "L1"},
+                {"code": "A", "quantity": -2, "reference": "L2"},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+        rows = StockRoom(self.root).movement_ledger("A")
+        self.assertEqual([row["kind"] for row in rows], ["movement", "movement"])
+        self.assertEqual([(row["before"], row["balance"]) for row in rows], [(0, 5), (5, 3)])
+        self.assertEqual([row["purchase_reference"] for row in rows], [None, None])
+        self.assertEqual([row["related_reference"] for row in rows], [None, None])
+
+    def test_query_does_not_modify_file_or_create_missing_file(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        self.app.movement_ledger("A")
+        self.app.movement_ledger("A", kind="purchase_return")
+        with self.assertRaises(ValueError):
+            self.app.movement_ledger("A", kind="bad")
+        with self.assertRaises(ValueError):
+            self.app.movement_ledger("UNKNOWN")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("A")["quantity"], 11)
+        self.assertEqual(len(self.app.history("A")), 6)
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.movement_ledger("A")
+        self.assertFalse((empty / "data.json").exists())
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args], text=True, capture_output=True)
+
+    def test_cli_movement_ledger(self):
+        self.seed_fixed_sample()
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"code": "A"}), encoding="utf-8")
+        result = self.run_cli("movement-ledger", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([row["balance"] for row in rows], [10, 8, 10, 14, 12, 11])
+        self.assertEqual([row["kind"] for row in rows],
+                         ["movement", "movement", "reversal", "purchase_receipt", "count", "purchase_return"])
+        payload.write_text(json.dumps({"code": "A", "kind": "purchase_return"}), encoding="utf-8")
+        result = self.run_cli("movement-ledger", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual(rows, [{"balance": 11, "before": 12, "code": "A", "kind": "purchase_return",
+                                 "purchase_reference": "P1", "quantity": -1, "reference": "RET1",
+                                 "related_reference": "IN1"}])
+
+    def test_cli_movement_ledger_array_and_errors(self):
+        self.seed_fixed_sample()
+        payload = self.root / "queries.json"
+        payload.write_text(json.dumps([{"code": "A", "kind": "count"}, {"code": "A", "kind": None}]), encoding="utf-8")
+        result = self.run_cli("movement-ledger", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([len(rows) for rows in value], [1, 6])
+        before = self.app.path.read_bytes()
+        for bad in ({"code": "UNKNOWN"}, {"code": "A", "kind": "COUNT"}, {"kind": "count"}):
+            with self.subTest(bad=bad):
+                bad_payload = self.root / "bad.json"
+                bad_payload.write_text(json.dumps(bad), encoding="utf-8")
+                result = self.run_cli("movement-ledger", str(bad_payload))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("error", result.stderr)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -139,6 +139,59 @@ class StockRoom(JsonStore):
         self.stock(code)
         return [row for row in self._read().get("movements", []) if row["code"] == code]
 
+    def movement_ledger(self, code, kind=None):
+        code = text(code, "code")
+        if kind is not None and kind not in ("movement", "count", "reversal", "purchase_receipt", "purchase_return"):
+            raise ValueError("kind must be movement, count, reversal, purchase_receipt, purchase_return or None")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        counts = {row["reference"] for row in data.get("counts", [])}
+        reversals = {row["reference"]: row["original_reference"] for row in data.get("reversals", [])}
+        receipts = {}
+        for purchase_reference, rows in data.get("purchase_receipts", {}).items():
+            for row in rows:
+                receipts[row["reference"]] = purchase_reference
+        returns = {}
+        for purchase_reference, rows in data.get("purchase_returns", {}).items():
+            for row in rows:
+                returns[row["reference"]] = (purchase_reference, row["receipt_reference"])
+        entries = []
+        before = 0
+        for row in data.get("movements", []):
+            if row["code"] != code:
+                continue
+            reference = row["reference"]
+            purchase_reference = None
+            related_reference = None
+            if reference in receipts:
+                row_kind = "purchase_receipt"
+                purchase_reference = receipts[reference]
+            elif reference in returns:
+                row_kind = "purchase_return"
+                purchase_reference, related_reference = returns[reference]
+            elif reference in reversals:
+                row_kind = "reversal"
+                related_reference = reversals[reference]
+            elif reference in counts:
+                row_kind = "count"
+            else:
+                row_kind = "movement"
+            balance = before + row["quantity"]
+            if kind is None or kind == row_kind:
+                entries.append({
+                    "code": code,
+                    "quantity": row["quantity"],
+                    "reference": reference,
+                    "before": before,
+                    "balance": balance,
+                    "kind": row_kind,
+                    "purchase_reference": purchase_reference,
+                    "related_reference": related_reference,
+                })
+            before = balance
+        return entries
+
     def count(self, code, counted, reference):
         code, reference = text(code, "code"), text(reference, "reference")
         if type(counted) is not int or counted < 0:
