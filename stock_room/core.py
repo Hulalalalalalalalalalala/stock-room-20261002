@@ -287,6 +287,21 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def export_inventory_csv(self, keyword="", active=None):
+        items = self.inventory(keyword=keyword, active=active)
+        lines = ["code,name,unit,quantity,minimum,active"]
+        for item in items:
+            fields = [
+                item["code"],
+                item["name"],
+                item["unit"],
+                str(item["quantity"]),
+                str(item["minimum"]),
+                "true" if item["active"] else "false",
+            ]
+            lines.append(",".join(_csv_field(value) for value in fields))
+        return "\n".join(lines) + "\n"
+
     def shortages(self):
         data = self._read()
         rows = data.get("movements", [])
@@ -306,6 +321,14 @@ class StockRoom(JsonStore):
             raise ValueError("reference already exists")
         if any(row["reference"] == reference for row in data.get("counts", [])):
             raise ValueError("reference already exists")
+
+def _csv_field(value):
+    # Strict CSV output: quote fields containing commas, quotes or line
+    # breaks; escape embedded quotes by doubling them. Other whitespace is
+    # preserved verbatim.
+    if any(char in value for char in (",", '"', "\r", "\n")):
+        return '"' + value.replace('"', '""') + '"'
+    return value
 
 def _parse_csv(content):
     # Strict CSV: comma-separated fields, double-quoted fields may contain
