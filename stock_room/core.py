@@ -462,6 +462,99 @@ class StockRoom(JsonStore):
         self._write(data)
         return [self._receipt_record(row) for row in planned]
 
+    def receive_purchase_batch(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        planned = self._plan_purchase_batch(data, rows)
+        movements = data.setdefault("movements", [])
+        receipts = data.setdefault("purchase_receipts", {})
+        for row in planned:
+            movements.append({"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]})
+            receipts.setdefault(row["purchase_reference"], []).append(self._receipt_record(row))
+        self._write(data)
+        return [self._batch_receipt_record(row) for row in planned]
+
+    def _plan_purchase_batch(self, data, rows):
+        # Cross-purchase receipt rules: rows are validated in input order and
+        # committed together. The (purchase, material) pair may appear once
+        # per batch while different purchases may receive the same material;
+        # the receipt quota is tracked per purchase and stock balances per
+        # material. Nothing is written here; the caller commits the plan.
+        orders = {
+            order["reference"]: (order, {line["code"]: line for line in order["rows"]})
+            for order in data.get("purchases", [])
+        }
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        existing = data.get("movements", [])
+        received_cache = {}
+        batch_received = {}
+        balances = {}
+        seen_pairs = set()
+        seen_references = set()
+        planned = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"purchase_reference", "code", "quantity", "reference"}:
+                raise ValueError("each row must be an object with purchase_reference, code, quantity and reference")
+            purchase_reference = text(entry["purchase_reference"], "purchase_reference")
+            code = text(entry["code"], "code")
+            reference = text(entry["reference"], "reference")
+            quantity = entry["quantity"]
+            if type(quantity) is not int or quantity <= 0:
+                raise ValueError("quantity must be a positive integer")
+            found = orders.get(purchase_reference)
+            if found is None:
+                raise ValueError("unknown purchase reference")
+            order, ordered = found
+            if order["status"] == "cancelled":
+                raise ValueError("purchase is cancelled")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+            if code not in ordered:
+                raise ValueError("material is not part of the purchase")
+            if materials[code]["unit"] != ordered[code]["unit"]:
+                raise ValueError("material unit differs from the purchase snapshot")
+            pair = (purchase_reference, code)
+            if pair in seen_pairs:
+                raise ValueError("material already exists in batch")
+            if purchase_reference not in received_cache:
+                received_cache[purchase_reference] = self._received_totals(data, purchase_reference)
+            batch_total = batch_received.get(pair, 0) + quantity
+            if received_cache[purchase_reference].get(code, 0) + batch_total > ordered[code]["quantity"]:
+                raise ValueError("received quantity exceeds ordered quantity")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            if code not in balances:
+                balances[code] = sum(row["quantity"] for row in existing if row["code"] == code)
+            before = balances[code]
+            balances[code] += quantity
+            seen_pairs.add(pair)
+            seen_references.add(reference)
+            batch_received[pair] = batch_total
+            planned.append({
+                "purchase_reference": purchase_reference,
+                "code": code,
+                "quantity": quantity,
+                "reference": reference,
+                "before": before,
+                "balance": balances[code],
+            })
+        return planned
+
+    @staticmethod
+    def _batch_receipt_record(row):
+        return {
+            "purchase_reference": row["purchase_reference"],
+            "code": row["code"],
+            "quantity": row["quantity"],
+            "reference": row["reference"],
+            "balance": row["balance"],
+        }
+
     def preview_purchase_receipts(self, purchase_reference, rows):
         purchase_reference = text(purchase_reference, "purchase_reference")
         if not isinstance(rows, list) or not rows:
