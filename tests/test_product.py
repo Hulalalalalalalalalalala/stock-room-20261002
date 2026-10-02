@@ -795,5 +795,191 @@ class ActiveStatusTests(unittest.TestCase):
         self.assertEqual(self.app.material_status("PAPER")["active"], True)
 
 
+class UpdateMaterialTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+
+    def seed_paper(self):
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_update_returns_latest_material_only(self):
+        record = self.app.update_material("  PAPER  ", " 加厚 包装纸 ", " 张 ")
+        self.assertEqual(record, {"code": "PAPER", "name": "加厚 包装纸", "unit": "张"})
+        self.assertEqual(self.app.stock("PAPER"), {"code": "PAPER", "name": "加厚 包装纸", "unit": "张", "quantity": 0})
+
+    def test_fixed_sample_rename_keeps_stock_then_combined_change_fails(self):
+        self.seed_paper()
+        record = self.app.update_material("PAPER", "加厚包装纸", "张")
+        self.assertEqual(record, {"code": "PAPER", "name": "加厚包装纸", "unit": "张"})
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装用纸", "包")
+        self.assertEqual(before, self.app.path.read_bytes())
+        material = StockRoom(self.root).stock("PAPER")
+        self.assertEqual((material["name"], material["unit"], material["quantity"]), ("加厚包装纸", "张", 14))
+
+    def test_box_unit_change_then_zero_count_locks_unit_and_reopen_keeps_all(self):
+        self.seed_paper()
+        self.app.update_material("PAPER", "加厚包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.assertEqual(self.app.update_material("BOX", "纸箱", "只"), {"code": "BOX", "name": "纸箱", "unit": "只"})
+        self.app.count("BOX", 0, "CNT-BOX-ZERO")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "纸箱", "个")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("BOX")["unit"], "只")
+        # Submitting the same unit still allows a rename after records exist.
+        self.assertEqual(self.app.update_material("BOX", " 纸箱二号 ", "只")["name"], "纸箱二号")
+        reopened = StockRoom(self.root)
+        box = reopened.stock("BOX")
+        self.assertEqual((box["name"], box["unit"], box["quantity"]), ("纸箱二号", "只", 0))
+        self.assertEqual([row["difference"] for row in reopened.counts("BOX")], [0])
+        paper = reopened.stock("PAPER")
+        self.assertEqual((paper["name"], paper["unit"], paper["quantity"]), ("加厚包装纸", "张", 14))
+        self.assertEqual([row["quantity"] for row in reopened.history("PAPER")], [20, -6])
+
+    def test_repeated_same_profile_succeeds_without_history(self):
+        first = self.app.update_material("PAPER", "包装纸", "张")
+        second = self.app.update_material("PAPER", "包装纸", "张")
+        self.assertEqual(first, second)
+        self.assertEqual(self.app.history("PAPER"), [])
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_unit_locked_by_zero_difference_count_and_reversed_movement(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("BOX", 5, "BOX-IN")
+        self.app.movement("BOX", -5, "BOX-OUT")
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "纸箱", "只")
+        self.app.reverse("BOX-OUT", "REV-BOX-OUT")
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "纸箱", "只")
+        self.app.count("PAPER", 0, "CNT-PAPER-ZERO")
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装纸", "包")
+        self.assertEqual(self.app.stock("BOX")["unit"], "个")
+        self.assertEqual(self.app.stock("PAPER")["unit"], "张")
+
+    def test_unit_comparison_is_exact_after_stripping(self):
+        self.assertEqual(self.app.update_material("PAPER", "包装纸", "  张  ")["unit"], "张")
+        self.seed_paper()
+        # Surrounding whitespace is stripped before comparing, so this is the same unit.
+        self.assertEqual(self.app.update_material("PAPER", "包装 纸", " 张 ")["unit"], "张")
+        # Internal whitespace is preserved and compared exactly.
+        self.app.register("TAPE", "胶带", "卷 装")
+        self.app.movement("TAPE", 1, "TAPE-IN")
+        with self.assertRaises(ValueError):
+            self.app.update_material("TAPE", "胶带", " 卷  装 ")
+
+    def test_active_and_inactive_materials_can_be_updated_with_status_kept(self):
+        self.seed_paper()
+        self.app.set_active("PAPER", False)
+        self.assertEqual(self.app.update_material("PAPER", "加厚包装纸", "张")["name"], "加厚包装纸")
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+        self.app.set_active("PAPER", True)
+        self.assertEqual(self.app.material_status("PAPER")["active"], True)
+        self.assertEqual(self.app.stock("PAPER")["name"], "加厚包装纸")
+
+    def test_invalid_arguments_and_unknown_code_rejected(self):
+        for kwargs in (
+            {"code": "", "name": "纸", "unit": "张"},
+            {"code": "   ", "name": "纸", "unit": "张"},
+            {"code": 11, "name": "纸", "unit": "张"},
+            {"code": None, "name": "纸", "unit": "张"},
+            {"code": "PAPER", "name": "", "unit": "张"},
+            {"code": "PAPER", "name": "   ", "unit": "张"},
+            {"code": "PAPER", "name": 11, "unit": "张"},
+            {"code": "PAPER", "name": None, "unit": "张"},
+            {"code": "PAPER", "name": "纸", "unit": ""},
+            {"code": "PAPER", "name": "纸", "unit": "   "},
+            {"code": "PAPER", "name": "纸", "unit": 11},
+            {"code": "PAPER", "name": "纸", "unit": None},
+            {"code": "paper", "name": "纸", "unit": "张"},
+            {"code": "UNKNOWN", "name": "纸", "unit": "张"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    self.app.update_material(**kwargs)
+
+    def test_failed_update_preserves_entire_file(self):
+        self.seed_paper()
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_active("PAPER", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装用纸", "包")
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "", "张")
+        with self.assertRaises(ValueError):
+            self.app.update_material("UNKNOWN", "x", "y")
+        self.assertEqual(before, self.app.path.read_bytes())
+        material = self.app.stock("PAPER")
+        self.assertEqual((material["name"], material["unit"], material["quantity"]), ("包装纸", "张", 14))
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["PAPER"])
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001", "OUT-001"])
+
+    def test_failed_update_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.update_material("PAPER", "纸", "张")
+        with self.assertRaises(ValueError):
+            app.update_material(11, "纸", "张")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_shortages_and_stock_show_latest_profile_without_reordering(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.seed_paper()
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_minimum("BOX", 3)
+        self.app.update_material("PAPER", "加厚包装纸", "张")
+        self.app.update_material("BOX", "纸盒", "个")
+        expected = [
+            {"code": "BOX", "name": "纸盒", "unit": "个", "quantity": 0, "minimum": 3, "shortage": 3},
+            {"code": "PAPER", "name": "加厚包装纸", "unit": "张", "quantity": 14, "minimum": 15, "shortage": 1},
+        ]
+        self.assertEqual(self.app.shortages(), expected)
+
+    def test_cli_update_material_success_and_failure(self):
+        payload = self.root / "update.json"
+        payload.write_text(json.dumps({"code": "PAPER", "name": "加厚包装纸", "unit": "张"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "update-material", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"code": "PAPER", "name": "加厚包装纸", "unit": "张"})
+        self.seed_paper()
+        bad = self.root / "bad-update.json"
+        bad.write_text(json.dumps({"code": "PAPER", "name": "包装用纸", "unit": "包"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "update-material", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", failed.stderr)
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["name"], "加厚包装纸")
+
+    def test_cli_update_material_array_keeps_earlier_success(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.seed_paper()
+        payload = self.root / "update-batch.json"
+        payload.write_text(json.dumps([
+            {"code": "BOX", "name": "纸盒", "unit": "只"},
+            {"code": "PAPER", "name": "包装用纸", "unit": "包"},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "update-material", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        box = self.app.stock("BOX")
+        self.assertEqual((box["name"], box["unit"]), ("纸盒", "只"))
+        paper = self.app.stock("PAPER")
+        self.assertEqual((paper["name"], paper["unit"], paper["quantity"]), ("包装纸", "张", 14))
+
+
 if __name__ == "__main__":
     unittest.main()
