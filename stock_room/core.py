@@ -1,4 +1,5 @@
 from .storage import JsonStore, text
+from .csv_import import parse_catalog
 
 class StockRoom(JsonStore):
     def register(self, code, name, unit):
@@ -10,6 +11,24 @@ class StockRoom(JsonStore):
         materials[code] = {"code": code, "name": name, "unit": unit}
         self._write(data)
         return materials[code]
+
+    def import_materials_csv(self, content):
+        rows = parse_catalog(content)
+        data = self._read()
+        materials = data.setdefault("materials", {})
+        parsed = []
+        seen = set()
+        for code, name, unit in rows:
+            if code in seen or code in materials:
+                raise ValueError("material already exists")
+            seen.add(code)
+            parsed.append({"code": code, "name": name, "unit": unit})
+        if not parsed:
+            return []
+        for material in parsed:
+            materials[material["code"]] = dict(material)
+        self._write(data)
+        return parsed
 
     def update_material(self, code, name, unit):
         code, name, unit = text(code, "code"), text(name, "name"), text(unit, "unit")

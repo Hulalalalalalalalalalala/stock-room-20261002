@@ -1130,5 +1130,161 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(before, self.app.path.read_bytes())
 
 
+class ImportCsvTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_existing_code_rejects_whole_file(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\r\nTAPE,胶带,卷\r\nPAPER,包装纸,张\r\n")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        with self.assertRaises(ValueError):
+            self.app.stock("TAPE")
+
+    def test_fixed_sample_two_new_materials_survive_reopen_with_zero_stock(self):
+        result = self.app.import_materials_csv("code,name,unit\nTAPE,胶带,卷\nBAG,包装袋,个\n")
+        self.assertEqual(result, [
+            {"code": "TAPE", "name": "胶带", "unit": "卷"},
+            {"code": "BAG", "name": "包装袋", "unit": "个"},
+        ])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 14)
+        for code, name, unit in (("TAPE", "胶带", "卷"), ("BAG", "包装袋", "个")):
+            self.assertEqual(reopened.stock(code), {"code": code, "name": name, "unit": unit, "quantity": 0})
+            self.assertEqual(reopened.material_status(code), {"code": code, "active": True})
+            self.assertEqual(reopened.history(code), [])
+            self.assertEqual(reopened.counts(code), [])
+            self.assertEqual(reopened.reversals(code), [])
+        self.assertEqual(reopened.shortages(), [])
+        self.assertEqual(reopened.movement("TAPE", 2, "TAPE-IN")["balance"], 2)
+
+    def test_header_only_returns_empty_and_writes_nothing(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_materials_csv("code,name,unit\n"), [])
+        self.assertEqual(app.import_materials_csv("unit,name,code\r\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_bom_reordered_header_crlf_and_inner_whitespace(self):
+        content = "﻿unit,code,name\r\n卷, T2 , 胶 带 \r\n"
+        self.assertEqual(self.app.import_materials_csv(content), [
+            {"code": "T2", "name": "胶 带", "unit": "卷"},
+        ])
+
+    def test_quoted_fields_escapes_and_embedded_comma_newline(self):
+        content = 'code,name,unit\n"A""B"," 线1\n线2 ",卷\nC1,"袋,装",个\n'
+        self.assertEqual(self.app.import_materials_csv(content), [
+            {"code": 'A"B', "name": "线1\n线2", "unit": "卷"},
+            {"code": "C1", "name": "袋,装", "unit": "个"},
+        ])
+
+    def test_empty_data_lines_ignored_but_whitespace_and_separator_lines_validated(self):
+        self.assertEqual(self.app.import_materials_csv("code,name,unit\n\nZ,胶,卷\n"),
+                         [{"code": "Z", "name": "胶", "unit": "卷"}])
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\n   \n")
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\n,,\n")
+
+    def test_invalid_headers_rejected(self):
+        for content in (
+            "code,name\r\nA,甲\r\n",
+            "code,name,unit,x\r\nA,甲,卷,1\r\n",
+            "code,name,name\r\nA,甲,卷\r\n",
+            " code,name,unit\r\nA,甲,卷\r\n",
+            "code, name ,unit\r\nA,甲,卷\r\n",
+            "CODE,name,unit\r\nA,甲,卷\r\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+
+    def test_column_count_and_empty_fields_rejected(self):
+        for content in (
+            "code,name,unit\nA,甲\n",
+            "code,name,unit\nA,甲,卷,1\n",
+            "code,name,unit\n,甲,卷\n",
+            "code,name,unit\nA, ,卷\n",
+            "code,name,unit\nA,甲,\n",
+            'code,name,unit\n"",甲,卷\n',
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+
+    def test_malformed_quotes_rejected(self):
+        for content in (
+            'code,name,unit\nA"B,甲,卷\n',
+            'code,name,unit\n"A,甲,卷\n',
+            'code,name,unit\n "A",甲,卷\n',
+            'code,name,unit\n"A"x,甲,卷\n',
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_materials_csv(content)
+
+    def test_duplicate_codes_within_file_and_case_sensitivity(self):
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nX,甲,个\n X ,乙,只\n")
+        with self.assertRaises(ValueError):
+            self.app.stock("X")
+        # identical profile and inactive material still conflict
+        self.app.set_active("PAPER", False)
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nPAPER,包装纸,张\n")
+        result = self.app.import_materials_csv("code,name,unit\npaper,纸,张\n")
+        self.assertEqual(result[0]["code"], "paper")
+
+    def test_invalid_content_type_and_empty_text_rejected_without_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        for content in ("", None, 1, b"code,name,unit\n", [], {}):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    app.import_materials_csv(content)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_failure_is_atomic_and_preserves_bytes_status_minimum_history(self):
+        self.app.set_active("PAPER", False)
+        self.app.set_minimum("PAPER", 15)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_materials_csv("code,name,unit\nGOOD,甲,卷\nBAD,乙\n")
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.stock("GOOD")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+        self.assertEqual(self.app.shortages()[0]["code"], "PAPER")
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+
+    def test_cli_import_success_failure_and_array(self):
+        payload = self.root / "in.json"
+        payload.write_text(json.dumps({"content": "code,name,unit\nTAPE,胶带,卷\nBAG,包装袋,个\n"}, ensure_ascii=False), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "import-materials-csv", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["code"] for row in json.loads(result.stdout)], ["TAPE", "BAG"])
+        payload.write_text(json.dumps({"content": "code,name,unit\nPAPER,包装纸,张\n"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "import-materials-csv", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", failed.stderr)
+        payload.write_text(json.dumps([
+            {"content": "code,name,unit\nC01,甲,卷\n"},
+            {"content": "code,name,unit\nC01,重复,卷\n"},
+        ]), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "import-materials-csv", str(payload)], text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 2)
+        self.assertEqual(StockRoom(self.root).stock("C01")["name"], "甲")
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 14)
+
+
 if __name__ == "__main__":
     unittest.main()
