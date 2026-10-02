@@ -2319,5 +2319,165 @@ class PurchaseReturnTests(unittest.TestCase):
         self.assertEqual([(row["quantity"], row["reference"]) for row in records], [(3, "RET-P-1")])
 
 
+class PurchaseProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("  PO-1  ", "供应商", [
+            {"code": "PAPER", "quantity": 10},
+            {"code": "BOX", "quantity": 4},
+        ])
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def figures(self, progress):
+        return [(row["received"], row["returned"], row["net_received"], row["remaining"]) for row in progress["rows"]]
+
+    def test_pending_structure_preserves_snapshot_and_order(self):
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual(list(progress), ["reference", "supplier", "status", "rows", "progress"])
+        self.assertEqual(progress["reference"], "PO-1")
+        self.assertEqual(progress["supplier"], "供应商")
+        self.assertEqual(progress["status"], "open")
+        self.assertEqual(progress["progress"], "pending")
+        self.assertEqual([row["code"] for row in progress["rows"]], ["PAPER", "BOX"])
+        self.assertEqual(progress["rows"][0], {
+            "code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 10,
+            "received": 0, "returned": 0, "net_received": 0, "remaining": 10,
+        })
+        self.assertEqual(progress["rows"][1], {
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 4,
+            "received": 0, "returned": 0, "net_received": 0, "remaining": 4,
+        })
+
+    def test_fixed_sample_partial_then_complete_survives_reopen_and_cancel(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-P-1"}])
+        self.app.return_purchase("RCV-P-1", 2, "RET-P-1")
+        progress = StockRoom(self.root).purchase_progress("  PO-1  ")
+        self.assertEqual(progress["progress"], "partial")
+        self.assertEqual(self.figures(progress), [(6, 2, 4, 4), (0, 0, 0, 4)])
+        # Return does not restore receipt quota: remaining stays based on receipts only.
+        self.app.receive_purchase("PO-1", [
+            {"code": "PAPER", "quantity": 4, "reference": "RCV-P-2"},
+            {"code": "BOX", "quantity": 4, "reference": "RCV-B-1"},
+        ])
+        progress = StockRoom(self.root).purchase_progress("PO-1")
+        self.assertEqual(progress["progress"], "complete")
+        self.assertEqual(self.figures(progress), [(10, 2, 8, 0), (4, 0, 4, 0)])
+        cancelled = self.app.cancel_purchase("PO-1")
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual(progress["status"], "cancelled")
+        self.assertEqual(progress["progress"], "complete")
+        self.assertEqual(progress["supplier"], cancelled["supplier"])
+        self.assertEqual(self.figures(progress), [(10, 2, 8, 0), (4, 0, 4, 0)])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-X"}])
+
+    def test_partial_when_any_row_unreceived_even_if_another_complete(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 10, "reference": "RCV-P-1"}])
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual(progress["progress"], "partial")
+        self.assertEqual(self.figures(progress), [(10, 0, 10, 0), (0, 0, 0, 4)])
+
+    def test_returns_never_make_order_pending_or_change_remaining(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 10, "reference": "RCV-P-1"}])
+        self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 4, "reference": "RCV-B-1"}])
+        self.app.return_purchase("RCV-P-1", 10, "RET-P-1")
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual(progress["progress"], "complete")
+        self.assertEqual(progress["rows"][0]["remaining"], 0)
+        self.assertEqual(self.figures(progress)[0], (10, 10, 0, 0))
+
+    def test_movements_counts_and_reversals_do_not_affect_stats(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-P-1"}])
+        self.app.movement("PAPER", 5, "IN-1")
+        self.app.movement("PAPER", -3, "OUT-1")
+        self.app.count("PAPER", 9, "CNT-1")
+        self.app.reverse("IN-1", "REV-1")
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual(self.figures(progress), [(6, 0, 6, 4), (0, 0, 0, 4)])
+        self.assertEqual(progress["progress"], "partial")
+
+    def test_snapshot_and_row_scope_survive_rename_and_deactivation(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-P-1"}])
+        self.app.update_material("PAPER", "新名称", "张")
+        self.app.set_active("BOX", False)
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual([(row["code"], row["name"], row["unit"]) for row in progress["rows"]],
+                         [("PAPER", "包装纸", "张"), ("BOX", "纸箱", "个")])
+        self.assertEqual(progress["rows"][0]["received"], 6)
+
+    def test_reference_trimming_case_and_internal_whitespace(self):
+        self.app.create_purchase("PO 2", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.assertEqual(self.app.purchase_progress("  PO 2  ")["reference"], "PO 2")
+        for reference in ("po-1", "PO-2", "po 2", "PO  2"):
+            with self.assertRaises(ValueError):
+                self.app.purchase_progress(reference)
+
+    def test_invalid_references_raise_value_error(self):
+        for reference in (None, 123, "", "   ", [], {}):
+            with self.assertRaises(ValueError):
+                self.app.purchase_progress(reference)
+        with self.assertRaises(ValueError):
+            self.app.purchase_progress("UNKNOWN")
+
+    def test_query_is_read_only_and_creates_no_file(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-P-1"}])
+        before = self.app.path.read_bytes()
+        self.app.purchase_progress("PO-1")
+        with self.assertRaises(ValueError):
+            self.app.purchase_progress("MISSING")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.purchase_progress("PO-1")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_without_receipts_or_returns_counts_as_zero(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-P-1"}])
+        self.app.return_purchase("RCV-P-1", 2, "RET-P-1")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchase_receipts", None)
+        data.pop("purchase_returns", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        progress = StockRoom(self.root).purchase_progress("PO-1")
+        self.assertEqual(progress["progress"], "pending")
+        self.assertEqual(self.figures(progress), [(0, 0, 0, 10), (0, 0, 0, 4)])
+
+    def test_cli_progress_object_and_array_success_and_failure(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-P-1"}])
+        self.app.return_purchase("RCV-P-1", 2, "RET-P-1")
+        payload = self.write_payload("progress.json", {"purchase_reference": "PO-1"})
+        result = self.run_cli("purchase-progress", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["progress"], "partial")
+        self.assertEqual(value["rows"][0]["received"], 6)
+        array_payload = self.write_payload("progresses.json", [
+            {"purchase_reference": "PO-1"}, {"purchase_reference": "PO-1"},
+        ])
+        result = self.run_cli("purchase-progress", array_payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)), 2)
+        bad = self.write_payload("bad.json", {"purchase_reference": "MISSING"})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("purchase-progress", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

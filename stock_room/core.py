@@ -409,10 +409,52 @@ class StockRoom(JsonStore):
             raise ValueError("unknown purchase reference")
         return [dict(row) for row in data.get("purchase_returns", {}).get(purchase_reference, [])]
 
+    def purchase_progress(self, purchase_reference):
+        purchase_reference = text(purchase_reference, "purchase_reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        received = self._received_totals(data, purchase_reference)
+        returned = self._returned_totals(data, purchase_reference)
+        rows = []
+        all_pending = True
+        all_complete = True
+        for line in order["rows"]:
+            code = line["code"]
+            received_qty = received.get(code, 0)
+            returned_qty = returned.get(code, 0)
+            if received_qty != 0:
+                all_pending = False
+            if received_qty != line["quantity"]:
+                all_complete = False
+            rows.append({
+                **dict(line),
+                "received": received_qty,
+                "returned": returned_qty,
+                "net_received": received_qty - returned_qty,
+                "remaining": line["quantity"] - received_qty,
+            })
+        progress = "pending" if all_pending else "complete" if all_complete else "partial"
+        return {
+            "reference": order["reference"],
+            "supplier": order["supplier"],
+            "status": order["status"],
+            "rows": rows,
+            "progress": progress,
+        }
+
     @staticmethod
     def _received_totals(data, purchase_reference):
         totals = {}
         for row in data.get("purchase_receipts", {}).get(purchase_reference, []):
+            totals[row["code"]] = totals.get(row["code"], 0) + row["quantity"]
+        return totals
+
+    @staticmethod
+    def _returned_totals(data, purchase_reference):
+        totals = {}
+        for row in data.get("purchase_returns", {}).get(purchase_reference, []):
             totals[row["code"]] = totals.get(row["code"], 0) + row["quantity"]
         return totals
 
