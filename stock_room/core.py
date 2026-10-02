@@ -211,6 +211,8 @@ class StockRoom(JsonStore):
             raise ValueError("cannot reverse a count")
         if any(row["reference"] == original_reference for row in reversals):
             raise ValueError("cannot reverse a reversal")
+        if any(row["reference"] == original_reference for row in data.get("receipts", [])):
+            raise ValueError("cannot reverse a purchase receipt")
         if any(row["original_reference"] == original_reference for row in reversals):
             raise ValueError("movement already reversed")
         original = next((row for row in data.get("movements", []) if row["reference"] == original_reference), None)
@@ -287,6 +289,93 @@ class StockRoom(JsonStore):
             order["status"] = "cancelled"
             self._write(data)
         return self._purchase_snapshot(order)
+
+    def receive_purchase(self, purchase_reference, rows):
+        purchase_reference = text(purchase_reference, "purchase_reference")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        if order["status"] == "cancelled":
+            raise ValueError("purchase is cancelled")
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        receipts = data.get("receipts", [])
+        existing = data.get("movements", [])
+        ordered = {row["code"]: row for row in order["rows"]}
+        received = {code: 0 for code in ordered}
+        for record in receipts:
+            if record["purchase_reference"] == purchase_reference:
+                received[record["code"]] = received.get(record["code"], 0) + record["quantity"]
+        balances = {}
+        seen_codes = set()
+        seen_references = set()
+        parsed = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "quantity", "reference"}:
+                raise ValueError("each row must be an object with code, quantity and reference")
+            code = text(entry["code"], "code")
+            reference = text(entry["reference"], "reference")
+            quantity = entry["quantity"]
+            if type(quantity) is not int or quantity <= 0:
+                raise ValueError("quantity must be a positive integer")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+            if code not in ordered:
+                raise ValueError("material is not part of the purchase")
+            material = materials[code]
+            snapshot = ordered[code]
+            if material["unit"] != snapshot["unit"]:
+                raise ValueError("material unit differs from the purchase snapshot")
+            if code in seen_codes:
+                raise ValueError("material already exists in batch")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            received[code] += quantity
+            if received[code] > snapshot["quantity"]:
+                raise ValueError("received quantity exceeds ordered quantity")
+            if code not in balances:
+                balances[code] = sum(row["quantity"] for row in existing if row["code"] == code)
+            balances[code] += quantity
+            seen_codes.add(code)
+            seen_references.add(reference)
+            parsed.append({
+                "code": code,
+                "quantity": quantity,
+                "reference": reference,
+                "balance": balances[code],
+                "purchase_reference": purchase_reference,
+            })
+        movements = data.setdefault("movements", [])
+        receipt_rows = data.setdefault("receipts", [])
+        for record in parsed:
+            movements.append({"code": record["code"], "quantity": record["quantity"], "reference": record["reference"]})
+            receipt_rows.append({
+                "purchase_reference": purchase_reference,
+                "code": record["code"],
+                "quantity": record["quantity"],
+                "reference": record["reference"],
+                "balance": record["balance"],
+            })
+        self._write(data)
+        return [{"code": row["code"], "quantity": row["quantity"], "reference": row["reference"], "balance": row["balance"]} for row in parsed]
+
+    def purchase_receipts(self, purchase_reference):
+        purchase_reference = text(purchase_reference, "purchase_reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        return [
+            {"code": row["code"], "quantity": row["quantity"], "reference": row["reference"], "balance": row["balance"]}
+            for row in data.get("receipts", [])
+            if row["purchase_reference"] == purchase_reference
+        ]
 
     @staticmethod
     def _purchase_snapshot(order):
