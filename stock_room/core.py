@@ -216,6 +216,9 @@ class StockRoom(JsonStore):
         receipt_references = {row["reference"] for receipts in data.get("purchase_receipts", {}).values() for row in receipts}
         if original_reference in receipt_references:
             raise ValueError("cannot reverse a purchase receipt")
+        return_references = {row["reference"] for rows in data.get("purchase_returns", {}).values() for row in rows}
+        if original_reference in return_references:
+            raise ValueError("cannot reverse a purchase return")
         original = next((row for row in data.get("movements", []) if row["reference"] == original_reference), None)
         if original is None:
             raise ValueError("unknown original reference")
@@ -355,6 +358,56 @@ class StockRoom(JsonStore):
         if order is None:
             raise ValueError("unknown purchase reference")
         return [dict(row) for row in data.get("purchase_receipts", {}).get(purchase_reference, [])]
+
+    def return_purchase(self, receipt_reference, quantity, reference):
+        receipt_reference = text(receipt_reference, "receipt_reference")
+        reference = text(reference, "reference")
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("quantity must be a positive integer")
+        data = self._read()
+        receipts = data.get("purchase_receipts", {})
+        purchase_reference = None
+        receipt = None
+        for purchase_ref, rows in receipts.items():
+            match = next((row for row in rows if row["reference"] == receipt_reference), None)
+            if match is not None:
+                purchase_reference = purchase_ref
+                receipt = match
+                break
+        if receipt is None:
+            raise ValueError("unknown receipt reference")
+        code = receipt["code"]
+        returned = 0
+        for row in data.get("purchase_returns", {}).get(purchase_reference, []):
+            if row["receipt_reference"] == receipt_reference:
+                returned += row["quantity"]
+        if returned + quantity > receipt["quantity"]:
+            raise ValueError("returned quantity exceeds received quantity")
+        self._require_unique_reference(data, reference)
+        stock = sum(row["quantity"] for row in data.get("movements", []) if row["code"] == code)
+        if stock < quantity:
+            raise ValueError("insufficient stock")
+        balance = stock - quantity
+        data.setdefault("movements", []).append({"code": code, "quantity": -quantity, "reference": reference})
+        record = {
+            "purchase_reference": purchase_reference,
+            "receipt_reference": receipt_reference,
+            "code": code,
+            "quantity": quantity,
+            "reference": reference,
+            "balance": balance,
+        }
+        data.setdefault("purchase_returns", {}).setdefault(purchase_reference, []).append(dict(record))
+        self._write(data)
+        return dict(record)
+
+    def purchase_returns(self, purchase_reference):
+        purchase_reference = text(purchase_reference, "purchase_reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        return [dict(row) for row in data.get("purchase_returns", {}).get(purchase_reference, [])]
 
     @staticmethod
     def _received_totals(data, purchase_reference):
