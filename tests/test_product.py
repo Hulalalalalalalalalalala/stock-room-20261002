@@ -1779,5 +1779,300 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual(StockRoom(self.root).purchase_order("PO-1")["status"], "open")
 
 
+class PurchaseReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.create_purchase("PO-1", " 甲 供应商 ", [
+            {"code": "PAPER", "quantity": 5},
+            {"code": "BOX", "quantity": 2},
+        ])
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def test_fixed_sample_split_receipts_survive_reopen(self):
+        first = self.app.receive_purchase(" PO-1 ", [
+            {"code": "  PAPER  ", "quantity": 3, "reference": "  RCV-P-1  "},
+        ])
+        self.assertEqual(first, [{"code": "PAPER", "quantity": 3, "reference": "RCV-P-1", "balance": 17}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [
+                {"code": "PAPER", "quantity": 3, "reference": "RCV-P-2"},
+                {"code": "BOX", "quantity": 1, "reference": "RCV-B-1"},
+            ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 17)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in self.app.purchase_receipts("PO-1")], ["RCV-P-1"])
+        second = self.app.receive_purchase("PO-1", [
+            {"code": "PAPER", "quantity": 2, "reference": "RCV-P-3"},
+            {"code": "BOX", "quantity": 2, "reference": "RCV-B-2"},
+        ])
+        self.assertEqual([(row["code"], row["quantity"], row["balance"]) for row in second],
+                         [("PAPER", 2, 19), ("BOX", 2, 2)])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 19)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 2)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 19)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 2)
+        receipts = reopened.purchase_receipts("PO-1")
+        self.assertEqual(receipts, [
+            {"code": "PAPER", "quantity": 3, "reference": "RCV-P-1", "balance": 17},
+            {"code": "PAPER", "quantity": 2, "reference": "RCV-P-3", "balance": 19},
+            {"code": "BOX", "quantity": 2, "reference": "RCV-B-2", "balance": 2},
+        ])
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")],
+                         ["IN-001", "OUT-001", "RCV-P-1", "RCV-P-3"])
+        self.assertEqual([row["reference"] for row in reopened.history("BOX")], ["RCV-B-2"])
+
+    def test_purchase_structure_snapshot_and_status_unchanged(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 5, "reference": "RCV-P-1"}])
+        order = self.app.purchase_order("PO-1")
+        self.assertEqual(order["status"], "open")
+        self.assertEqual(order["rows"], [
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 5},
+            {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 2},
+        ])
+        self.app.update_material("PAPER", "高级包装纸", "张")
+        self.assertEqual(self.app.purchase_order("PO-1")["rows"][0]["name"], "包装纸")
+
+    def test_cancel_after_receipt_keeps_stock_and_records(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-P-1"}])
+        cancelled = self.app.cancel_purchase("PO-1")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(self.app.cancel_purchase("PO-1"), cancelled)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 17)
+        self.assertEqual(self.app.purchase_receipts("PO-1")[0]["reference"], "RCV-P-1")
+
+    def test_unknown_and_cancelled_purchase_rejected(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("MISSING", [{"code": "PAPER", "quantity": 1, "reference": "RCV-X"}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("  ", [{"code": "PAPER", "quantity": 1, "reference": "RCV-X"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.app.cancel_purchase("PO-1")
+        after_cancel = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-X"}])
+        self.assertEqual(self.app.path.read_bytes(), after_cancel)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.purchase_receipts("PO-1"), [])
+
+    def test_invalid_rows_and_row_shape_rejected(self):
+        for rows in (None, [], {}, "x", 1):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.receive_purchase("PO-1", rows)
+        good = {"code": "PAPER", "quantity": 1, "reference": "RCV-X"}
+        for rows in (
+            [None],
+            ["PAPER"],
+            [[]],
+            [{"code": "PAPER", "quantity": 1}],
+            [{"code": "PAPER", "reference": "R"}],
+            [{"quantity": 1, "reference": "R"}],
+            [{"code": "PAPER", "quantity": 1, "reference": "R", "extra": 1}],
+            [good, good],
+        ):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.receive_purchase("PO-1", rows)
+
+    def test_invalid_identifiers_and_quantity_rejected(self):
+        for code in ("", "   ", 11, None):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.receive_purchase("PO-1", [{"code": code, "quantity": 1, "reference": "R"}])
+        for reference in ("", "   ", 11, None):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": reference}])
+        for quantity in (0, -1, True, False, 1.5, "1", None, [1]):
+            with self.subTest(quantity=quantity):
+                with self.assertRaises(ValueError):
+                    self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": quantity, "reference": "R"}])
+
+    def test_unknown_inactive_unlisted_and_unit_mismatch_rejected(self):
+        self.app.register("INK", "油墨", "瓶")
+        self.app.set_active("BOX", False)
+        self.app.create_purchase("PO-2", "供应商", [{"code": "INK", "quantity": 3}])
+        self.app.update_material("INK", "油墨", "桶")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "UNKNOWN", "quantity": 1, "reference": "RCV-X"}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 1, "reference": "RCV-X"}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "INK", "quantity": 1, "reference": "RCV-X"}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-2", [{"code": "INK", "quantity": 1, "reference": "RCV-X"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([row["reference"] for row in self.app.history("INK")], [])
+
+    def test_duplicate_code_within_batch_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [
+                {"code": "PAPER", "quantity": 1, "reference": "RCV-A"},
+                {"code": " PAPER ", "quantity": 1, "reference": "RCV-B"},
+            ])
+
+    def test_cumulative_quantity_capped_by_order(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-P-1"}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-P-2"}])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 17)
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [
+                {"code": "BOX", "quantity": 1, "reference": "RCV-B-1"},
+                {"code": "BOX", "quantity": 2, "reference": "RCV-B-2"},
+            ])
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        # Exactly the remainder succeeds.
+        self.app.receive_purchase("PO-1", [
+            {"code": "PAPER", "quantity": 2, "reference": "RCV-P-3"},
+            {"code": "BOX", "quantity": 2, "reference": "RCV-B-3"},
+        ])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-P-4"}])
+
+    def test_received_totals_follow_only_associations(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 5, "reference": "RCV-P-1"}])
+        self.app.movement("PAPER", -10, "OUT-002")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 9)
+        # Lower stock does not free ordered capacity; other receipts stay capped at zero.
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-P-2"}])
+        self.app.count("PAPER", 20, "CNT-001")
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-P-3"}])
+
+    def test_receipt_reference_scope_is_shared_with_all_histories(self):
+        self.app.count("BOX", 0, "CNT-ZERO")
+        self.app.reverse("OUT-001", "REV-OUT")
+        for reference in ("IN-001", "CNT-ZERO", "REV-OUT"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": reference}])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [
+                {"code": "PAPER", "quantity": 1, "reference": "DUP"},
+                {"code": "BOX", "quantity": 1, "reference": "  DUP  "},
+            ])
+
+    def test_purchase_reference_stays_independent(self):
+        self.app.create_purchase("RCV-P-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        record = self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-P-1"}])
+        self.assertEqual(record[0]["reference"], "RCV-P-1")
+
+    def test_failed_receipt_preserves_file_and_all_state(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [
+                {"code": "PAPER", "quantity": 1, "reference": "RCV-OK"},
+                {"code": "BOX", "quantity": 3, "reference": "RCV-BAD"},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "IN-001"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(self.app.purchase_receipts("PO-1"), [])
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        # Rejected references are reusable.
+        record = self.app.receive_purchase("PO-1", [
+            {"code": "PAPER", "quantity": 1, "reference": "RCV-OK"},
+        ])
+        self.assertEqual(record[0]["balance"], 15)
+
+    def test_failed_receipt_on_empty_directory_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.receive_purchase("PO-1", [])
+        with self.assertRaises(ValueError):
+            app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "R"}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_receipt_movement_cannot_be_reversed(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-P-1"}])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse("RCV-P-1", "REV-RCV")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        record = self.app.reverse("OUT-001", "REV-OUT")
+        self.assertEqual(record["balance"], 23)
+
+    def test_purchase_receipts_query_variants_and_read_only(self):
+        self.assertEqual(self.app.purchase_receipts("PO-1"), [])
+        with self.assertRaises(ValueError):
+            self.app.purchase_receipts("MISSING")
+        with self.assertRaises(ValueError):
+            self.app.purchase_receipts("  ")
+        before = self.app.path.read_bytes()
+        self.app.purchase_receipts("PO-1")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_legacy_data_without_receipts_returns_empty(self):
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchase_receipts", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.purchase_receipts("PO-1"), [])
+        record = reopened.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-P-1"}])
+        self.assertEqual(record[0]["balance"], 15)
+
+    def test_query_on_empty_directory_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.purchase_receipts("PO-1")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_cli_receive_and_query(self):
+        payload = self.write_payload("receive.json", {"purchase_reference": "PO-1", "rows": [
+            {"code": "PAPER", "quantity": 3, "reference": "RCV-P-1"},
+        ]})
+        result = self.run_cli("receive-purchase", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         [{"code": "PAPER", "quantity": 3, "reference": "RCV-P-1", "balance": 17}])
+        query = self.write_payload("query.json", {"purchase_reference": "PO-1"})
+        result = self.run_cli("purchase-receipts", query)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["reference"] for row in json.loads(result.stdout)], ["RCV-P-1"])
+        bad = self.write_payload("bad.json", {"purchase_reference": "PO-1", "rows": [
+            {"code": "PAPER", "quantity": 3, "reference": "RCV-P-2"},
+        ]})
+        failed = self.run_cli("receive-purchase", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 17)
+
+    def test_cli_array_keeps_earlier_commit(self):
+        payload = self.write_payload("receives.json", [
+            {"purchase_reference": "PO-1", "rows": [{"code": "PAPER", "quantity": 1, "reference": "RCV-1"}]},
+            {"purchase_reference": "PO-1", "rows": [{"code": "PAPER", "quantity": 5, "reference": "RCV-2"}]},
+        ])
+        result = self.run_cli("receive-purchase", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 15)
+        self.assertEqual([row["reference"] for row in self.app.purchase_receipts("PO-1")], ["RCV-1"])
+
+
 if __name__ == "__main__":
     unittest.main()
