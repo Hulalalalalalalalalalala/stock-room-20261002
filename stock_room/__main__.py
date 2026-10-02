@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import StockRoom
 
-ACTIONS = {'register': 'register', 'update-material': 'update_material', 'move': 'movement', 'move-batch': 'movement_batch', 'stock': 'stock', 'history': 'history', 'count': 'count', 'counts': 'counts', 'reverse': 'reverse', 'reversals': 'reversals', 'set-minimum': 'set_minimum', 'shortages': 'shortages', 'inventory': 'inventory', 'set-active': 'set_active', 'material-status': 'material_status'}
+ACTIONS = {'register': 'register', 'update-material': 'update_material', 'move': 'movement', 'move-batch': 'movement_batch', 'stock': 'stock', 'history': 'history', 'count': 'count', 'count-batch': 'count_batch', 'counts': 'counts', 'reverse': 'reverse', 'reversals': 'reversals', 'set-minimum': 'set_minimum', 'shortages': 'shortages', 'inventory': 'inventory', 'set-active': 'set_active', 'material-status': 'material_status'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

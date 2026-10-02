@@ -114,6 +114,47 @@ class StockRoom(JsonStore):
         self._write(data)
         return dict(record)
 
+    def count_batch(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        materials = data.get("materials", {})
+        movements = data.get("movements", [])
+        balances = {}
+        seen_codes = set()
+        seen_references = set()
+        parsed = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "counted", "reference"}:
+                raise ValueError("each row must be an object with code, counted and reference")
+            code = text(entry["code"], "code")
+            reference = text(entry["reference"], "reference")
+            counted = entry["counted"]
+            if type(counted) is not int or counted < 0:
+                raise ValueError("counted must be a nonnegative integer")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if code in seen_codes:
+                raise ValueError("material already appears in this batch")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            if code not in balances:
+                balances[code] = sum(row["quantity"] for row in movements if row["code"] == code)
+            before = balances[code]
+            difference = counted - before
+            seen_codes.add(code)
+            seen_references.add(reference)
+            parsed.append({"code": code, "reference": reference, "before": before, "counted": counted, "difference": difference})
+            balances[code] = counted
+        counts = data.setdefault("counts", [])
+        for record in parsed:
+            counts.append({key: record[key] for key in ("code", "reference", "before", "counted", "difference")})
+            if record["difference"] != 0:
+                data.setdefault("movements", []).append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return parsed
+
     def counts(self, code):
         code = text(code, "code")
         data = self._read()

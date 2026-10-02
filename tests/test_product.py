@@ -183,6 +183,239 @@ class CountTests(unittest.TestCase):
         self.assertEqual(len(self.app.counts("PAPER")), 1)
         self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
 
+class CountBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.set_active("BOX", False)
+
+    def sample_rows(self):
+        return [
+            {"code": "PAPER", "counted": 11, "reference": "CNT-P"},
+            {"code": "BOX", "counted": 0, "reference": "CNT-B"},
+        ]
+
+    def test_fixed_sample_adjusts_only_nonzero_and_survives_reopen(self):
+        results = self.app.count_batch(self.sample_rows())
+        self.assertEqual(results, [
+            {"code": "PAPER", "reference": "CNT-P", "before": 14, "counted": 11, "difference": -3},
+            {"code": "BOX", "reference": "CNT-B", "before": 0, "counted": 0, "difference": 0},
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual([(row["quantity"], row["reference"]) for row in self.app.history("PAPER")], [(20, "IN-001"), (-6, "OUT-001"), (-3, "CNT-P")])
+        self.assertEqual(self.app.history("BOX"), [])
+        self.assertEqual([row["reference"] for row in self.app.counts("PAPER")], ["CNT-P"])
+        self.assertEqual([row["reference"] for row in self.app.counts("BOX")], ["CNT-B"])
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 11)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in reopened.counts("PAPER")], ["CNT-P"])
+        self.assertEqual([(row["before"], row["counted"], row["difference"]) for row in reopened.counts("BOX")], [(0, 0, 0)])
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")], ["IN-001", "OUT-001", "CNT-P"])
+        self.assertEqual(reopened.history("BOX"), [])
+        self.assertEqual(reopened.material_status("BOX")["active"], False)
+
+    def test_successful_references_cannot_be_reused_after_reopen(self):
+        self.app.count_batch(self.sample_rows())
+        reopened = StockRoom(self.root)
+        with self.assertRaises(ValueError):
+            reopened.count("PAPER", 11, "CNT-P")
+        with self.assertRaises(ValueError):
+            reopened.count_batch([{"code": "BOX", "counted": 0, "reference": "CNT-B"}])
+        with self.assertRaises(ValueError):
+            reopened.movement("PAPER", 1, "CNT-P")
+        with self.assertRaises(ValueError):
+            reopened.movement("PAPER", 1, "CNT-B")
+
+    def test_failed_references_can_be_reused(self):
+        with self.assertRaises(ValueError):
+            self.app.count_batch([{"code": "PAPER", "counted": -1, "reference": "CNT-FAIL"}])
+        results = self.app.count_batch([{"code": "PAPER", "counted": 11, "reference": "CNT-FAIL"}])
+        self.assertEqual(results[0]["difference"], -3)
+
+    def test_before_uses_pre_submission_ledger(self):
+        self.app.register("TAPE", "胶带", "卷")
+        results = self.app.count_batch([
+            {"code": "TAPE", "counted": 2, "reference": "CNT-T"},
+            {"code": "PAPER", "counted": 11, "reference": "CNT-P"},
+        ])
+        self.assertEqual([(row["code"], row["before"], row["difference"]) for row in results], [("TAPE", 0, 2), ("PAPER", 14, -3)])
+        self.assertEqual(self.app.stock("TAPE")["quantity"], 2)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
+
+    def test_invalid_rows_shape_rejected(self):
+        for rows in (None, [], {}, "x", 1):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.count_batch(rows)
+
+    def test_invalid_row_shape_rejected(self):
+        good = {"code": "PAPER", "counted": 11, "reference": "OK"}
+        for rows in (
+            [None],
+            ["PAPER"],
+            [[]],
+            [{"code": "PAPER", "counted": 11}],
+            [{"code": "PAPER", "reference": "R"}],
+            [{"counted": 11, "reference": "R"}],
+            [{"code": "PAPER", "counted": 11, "reference": "R", "extra": 1}],
+            [good, good],
+        ):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.count_batch(rows)
+
+    def test_invalid_identifiers_and_counted_rejected(self):
+        for code in ("", "   ", 11, None, "UNKNOWN", "paper"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.count_batch([{"code": code, "counted": 11, "reference": "R"}])
+        for reference in ("", "   ", 11, None, "IN-001"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.count_batch([{"code": "PAPER", "counted": 11, "reference": reference}])
+        for counted in (-1, True, False, 1.5, "11", None, [11]):
+            with self.subTest(counted=counted):
+                with self.assertRaises(ValueError):
+                    self.app.count_batch([{"code": "PAPER", "counted": counted, "reference": "R"}])
+
+    def test_identifiers_are_stripped_and_case_sensitive(self):
+        results = self.app.count_batch([{"code": "  PAPER  ", "counted": 11, "reference": "  CNT-STRIP  "}])
+        self.assertEqual(results[0]["code"], "PAPER")
+        self.assertEqual(results[0]["reference"], "CNT-STRIP")
+        with self.assertRaises(ValueError):
+            self.app.count_batch([{"code": "PAPER", "counted": 11, "reference": "  CNT-STRIP  "}])
+        with self.assertRaises(ValueError):
+            self.app.count_batch([{"code": "paper", "counted": 11, "reference": "CNT-LOWER"}])
+
+    def test_duplicate_material_within_batch_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.count_batch([
+                {"code": "PAPER", "counted": 11, "reference": "CNT-1"},
+                {"code": "  PAPER  ", "counted": 10, "reference": "CNT-2"},
+            ])
+
+    def test_reference_conflicts_within_batch_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.count_batch([
+                {"code": "PAPER", "counted": 11, "reference": "DUP"},
+                {"code": "BOX", "counted": 0, "reference": "  DUP  "},
+            ])
+
+    def test_reference_conflicts_with_existing_histories_rejected(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        self.app.reverse("OUT-001", "REV-OUT")
+        for reference in ("IN-001", "CNT-ZERO", "REV-OUT"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.count_batch([{"code": "BOX", "counted": 0, "reference": reference}])
+
+    def test_failed_batch_preserves_bytes_histories_minimum_and_status(self):
+        self.app.set_minimum("BOX", 2)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.count_batch([
+                {"code": "PAPER", "counted": 11, "reference": "CNT-OK"},
+                {"code": "BOX", "counted": -1, "reference": "CNT-BAD"},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.count_batch([
+                {"code": "PAPER", "counted": 11, "reference": "CNT-1"},
+                {"code": "PAPER", "counted": 10, "reference": "CNT-2"},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.count_batch([{"code": "PAPER", "counted": 11, "reference": "IN-001"}])
+        with self.assertRaises(ValueError):
+            self.app.count_batch([{"code": "UNKNOWN", "counted": 1, "reference": "CNT-U"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual(self.app.history("BOX"), [])
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+
+    def test_failed_batch_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.count_batch([])
+        with self.assertRaises(ValueError):
+            app.count_batch([{"code": "PAPER", "counted": 1, "reference": "R"}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_batch_count_locks_unit_including_zero_difference(self):
+        self.app.count_batch(self.sample_rows())
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装纸", "包")
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "纸箱", "只")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.update_material("BOX", "纸箱", "个")["name"], "纸箱")
+
+    def test_batch_count_references_cannot_be_reversed(self):
+        self.app.count_batch(self.sample_rows())
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-P", "REV-P")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-B", "REV-B")
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
+
+    def test_cli_count_batch_success_and_failure(self):
+        payload = self.root / "batch.json"
+        payload.write_text(json.dumps({"rows": self.sample_rows()}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "count-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["difference"] for row in json.loads(result.stdout)], [-3, 0])
+        bad = self.root / "bad-batch.json"
+        bad.write_text(json.dumps({"rows": [
+            {"code": "PAPER", "counted": 10, "reference": "CNT-2"},
+            {"code": "PAPER", "counted": 9, "reference": "CNT-3"},
+        ]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "count-batch", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", failed.stderr)
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 11)
+        self.assertEqual([row["reference"] for row in StockRoom(self.root).counts("PAPER")], ["CNT-P"])
+
+    def test_cli_count_batch_failure_on_empty_directory_returns_2(self):
+        empty = self.root / "empty"
+        payload = self.root / "empty-batch.json"
+        payload.write_text(json.dumps({"rows": [{"code": "PAPER", "counted": 1, "reference": "CNT-X"}]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(empty), "count-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_cli_count_batch_array_keeps_earlier_batch(self):
+        payload = self.root / "batches.json"
+        payload.write_text(json.dumps([
+            {"rows": [{"code": "PAPER", "counted": 11, "reference": "CNT-ONE"}]},
+            {"rows": [{"code": "BOX", "counted": 0, "reference": "CNT-ONE"}]},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "count-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in self.app.counts("PAPER")], ["CNT-ONE"])
+        self.assertEqual(self.app.counts("BOX"), [])
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")][-1], "CNT-ONE")
+
+
 class ReversalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
