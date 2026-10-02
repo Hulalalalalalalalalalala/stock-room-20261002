@@ -11,6 +11,24 @@ class StockRoom(JsonStore):
         self._write(data)
         return materials[code]
 
+    def update_material(self, code, name, unit):
+        code, name, unit = text(code, "code"), text(name, "name"), text(unit, "unit")
+        data = self._read()
+        materials = data.get("materials", {})
+        if code not in materials:
+            raise ValueError("unknown material")
+        if unit != materials[code]["unit"]:
+            if any(row["code"] == code for row in data.get("movements", [])):
+                raise ValueError("unit cannot change after stock history exists")
+            if any(row["code"] == code for row in data.get("counts", [])):
+                raise ValueError("unit cannot change after stock history exists")
+            if any(row["code"] == code for row in data.get("reversals", [])):
+                raise ValueError("unit cannot change after stock history exists")
+        materials[code]["name"] = name
+        materials[code]["unit"] = unit
+        self._write(data)
+        return {"code": code, "name": name, "unit": unit}
+
     def movement(self, code, quantity, reference):
         reference = text(reference, "reference")
         if type(quantity) is not int or quantity == 0:
