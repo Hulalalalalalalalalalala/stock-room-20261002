@@ -1161,6 +1161,263 @@ class CsvImportTests(unittest.TestCase):
         self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
 
 
+class ImportCountsCsvTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_paper_minus_two_box_zero_survives_reopen(self):
+        result = self.app.import_counts_csv("code,counted,reference\nPAPER,12,CNT-001\nBOX,0,CNT-002\n")
+        self.assertEqual(result, [
+            {"code": "PAPER", "reference": "CNT-001", "before": 14, "counted": 12, "difference": -2},
+            {"code": "BOX", "reference": "CNT-002", "before": 0, "counted": 0, "difference": 0},
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(len(self.app.counts("PAPER")), 1)
+        self.assertEqual(len(self.app.counts("BOX")), 1)
+        self.assertEqual([row["quantity"] for row in self.app.history("PAPER")], [20, -6, -2])
+        self.assertEqual(self.app.history("PAPER")[-1]["reference"], "CNT-001")
+        self.assertEqual(self.app.history("BOX"), [])
+        reopened = StockRoom(self.root)
+        self.assertEqual([row["counted"] for row in reopened.counts("PAPER")], [12])
+        self.assertEqual([row["reference"] for row in reopened.counts("BOX")], ["CNT-002"])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 0)
+        self.assertEqual(len(reopened.history("PAPER")), 3)
+
+    def test_reimport_same_references_rejects_whole_document(self):
+        content = "code,counted,reference\nPAPER,12,CNT-001\nBOX,0,CNT-002\n"
+        self.app.import_counts_csv(content)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv(content)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(len(self.app.counts("PAPER")), 1)
+        self.assertEqual(len(self.app.counts("BOX")), 1)
+
+    def test_bom_crlf_reordered_header_quoted_and_blank_lines(self):
+        content = "﻿reference,counted,code\r\nCNT-001,\"12\",PAPER\r\n\r\n\"CNT-002\",000,BOX\r\n"
+        result = self.app.import_counts_csv(content)
+        self.assertEqual([(row["code"], row["reference"], row["counted"], row["difference"]) for row in result], [
+            ("PAPER", "CNT-001", 12, -2),
+            ("BOX", "CNT-002", 0, 0),
+        ])
+
+    def test_quoted_fields_support_commas_newlines_and_doubled_quotes(self):
+        content = 'code,counted,reference\r\nPAPER,12,"CNT,\r\n00""1"\r\n'
+        result = self.app.import_counts_csv(content)
+        self.assertEqual(result[0]["reference"], 'CNT,\r\n00"1')
+        self.assertEqual(self.app.counts("PAPER")[0]["reference"], 'CNT,\r\n00"1')
+
+    def test_header_only_returns_empty_without_writing(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_counts_csv("code,counted,reference\n"), [])
+        self.assertEqual(app.import_counts_csv("reference,code,counted\r\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.import_counts_csv("counted,reference,code\n\n\r\n"), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv("counted,reference,code\n\n   \n")
+
+    def test_whitespace_only_and_separator_only_records_are_validated(self):
+        for content in (
+            "code,counted,reference\n   \n",
+            "code,counted,reference\n,,\n",
+            "code,counted,reference\n , , \n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+
+    def test_invalid_content_and_header_rejected(self):
+        for content in ("", "﻿", None, 11, ["code"], {"c": "x"}):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+        for content in (
+            "code,counted\n",
+            "code,counted,reference,extra\n",
+            "code,code,reference\n",
+            "code,counted,counted\n",
+            " code,counted,reference\n",
+            "code ,counted,reference\n",
+            "CODE,counted,reference\n",
+            "code,count,reference\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+
+    def test_invalid_quotes_rejected(self):
+        for content in (
+            'code,counted,reference\n"PAPER,12,CNT-001\n',
+            'code,counted,reference\nPAP"ER,12,CNT-001\n',
+            'code,counted,reference\n"PAPER"x,12,CNT-001\n',
+            'code,counted,reference\n "PAPER",12,CNT-001\n',
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+
+    def test_wrong_column_count_and_empty_identifiers_rejected(self):
+        for content in (
+            "code,counted,reference\nPAPER,12\n",
+            "code,counted,reference\nPAPER,12,CNT-X,extra\n",
+            "code,counted,reference\n,12,CNT-X\n",
+            "code,counted,reference\n   ,12,CNT-X\n",
+            "code,counted,reference\nPAPER,12,  \n",
+            "code,counted,reference\nPAPER,12,\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+
+    def test_counted_accepts_digits_only_with_zero_and_leading_zeros(self):
+        for value in ("0", "00", "007", "12", "  012  "):
+            with self.subTest(value=value):
+                reference = "CNT-" + value.strip().replace(" ", "B")
+                result = self.app.import_counts_csv(
+                    "code,counted,reference\nPAPER," + value + "," + reference + "\n"
+                )
+                self.assertEqual(result[0]["counted"], int(value.strip()))
+                self.assertEqual(result[0]["reference"], reference)
+
+    def test_counted_rejects_signs_decimals_scientific_and_other_characters(self):
+        for value in ("", "  ", "+", "-1", "+1", "1.0", ".5", "1e3", "1E3", "0x1",
+                      "1 2", "１２", "①", "1_000", "nan", "inf", "1."):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv("code,counted,reference\nPAPER," + value + ",CNT-X\n")
+
+    def test_identifiers_stripped_internal_whitespace_kept_and_case_sensitive(self):
+        self.app.register("PA PER", "纸 张", "张")
+        result = self.app.import_counts_csv('code,counted,reference\n" PA PER ",12," CNT 001 "\n')
+        self.assertEqual(result[0]["code"], "PA PER")
+        self.assertEqual(result[0]["reference"], "CNT 001")
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv("code,counted,reference\npaper,12,CNT-LOWER\n")
+
+    def test_duplicate_codes_and_references_within_document_rejected(self):
+        before = self.app.path.read_bytes()
+        for content in (
+            "code,counted,reference\nPAPER,12,CNT-001\nPAPER,10,CNT-002\n",
+            "code,counted,reference\n PAPER ,12,CNT-001\nPAPER,10,CNT-002\n",
+            "code,counted,reference\nPAPER,12,CNT-001\nBOX,0, CNT-001 \n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+
+    def test_references_conflict_with_movements_counts_and_reversals(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        self.app.reverse("OUT-001", "REV-OUT")
+        for content in (
+            "code,counted,reference\nPAPER,12,IN-001\n",
+            "code,counted,reference\nPAPER,12,CNT-ZERO\n",
+            "code,counted,reference\nPAPER,12,REV-OUT\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_counts_csv(content)
+
+    def test_unknown_material_rejects_whole_document(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv("code,counted,reference\nPAPER,12,CNT-001\nOTHER,0,CNT-002\n")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_inactive_materials_can_be_counted(self):
+        self.app.set_active("BOX", False)
+        result = self.app.import_counts_csv("code,counted,reference\nBOX,3,CNT-BOX\nPAPER,12,CNT-PAPER\n")
+        self.assertEqual([row["code"] for row in result], ["BOX", "PAPER"])
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+
+    def test_failed_import_preserves_bytes_and_all_state_and_frees_references(self):
+        self.app.set_minimum("BOX", 2)
+        self.app.set_active("BOX", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv("code,counted,reference\nPAPER,12,CNT-NEW\nOTHER,0,CNT-OTHER\n")
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv("code,counted,reference\nPAPER,12,IN-001\n")
+        with self.assertRaises(ValueError):
+            self.app.import_counts_csv(11)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.material_status("BOX")["active"], False)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+        result = self.app.import_counts_csv("code,counted,reference\nPAPER,12,CNT-NEW\n")
+        self.assertEqual(result[0]["difference"], -2)
+
+    def test_failed_import_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.import_counts_csv("code,counted,reference\nPAPER,12\n")
+        with self.assertRaises(ValueError):
+            app.import_counts_csv("")
+        with self.assertRaises(ValueError):
+            app.import_counts_csv("code,counted,reference\nPAPER,12,X\n")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_zero_difference_locks_unit_occupies_reference_and_cannot_be_reversed(self):
+        self.app.import_counts_csv("code,counted,reference\nBOX,0,CNT-BOX\n")
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "纸箱", "只")
+        with self.assertRaises(ValueError):
+            self.app.movement("BOX", 1, "CNT-BOX")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-BOX", "REV-BOX")
+        self.assertEqual(self.app.stock("BOX")["unit"], "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args], text=True, capture_output=True)
+
+    def test_cli_import_success_and_failure(self):
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"content": "code,counted,reference\nPAPER,12,CNT-001\nBOX,0,CNT-002\n"}), encoding="utf-8")
+        result = self.run_cli("import-counts-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["difference"] for row in json.loads(result.stdout)], [-2, 0])
+        bad = self.root / "bad-import.json"
+        bad.write_text(json.dumps({"content": "code,counted,reference\nPAPER,12,CNT-001\n"}), encoding="utf-8")
+        failed = self.run_cli("import-counts-csv", str(bad))
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(len(self.app.counts("PAPER")), 1)
+
+    def test_cli_import_array_keeps_earlier_success(self):
+        payload = self.root / "imports.json"
+        payload.write_text(json.dumps([
+            {"content": "code,counted,reference\nPAPER,12,CNT-001\n"},
+            {"content": "code,counted,reference\nPAPER,12,CNT-001\n"},
+        ]), encoding="utf-8")
+        result = self.run_cli("import-counts-csv", str(payload))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(len(self.app.counts("PAPER")), 1)
+
+
 class InventoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

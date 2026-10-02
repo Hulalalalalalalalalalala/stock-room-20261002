@@ -213,12 +213,7 @@ class StockRoom(JsonStore):
     def count_batch(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
-        data = self._read()
-        materials = data.get("materials", {})
-        existing = data.get("movements", [])
-        parsed = []
-        seen_codes = set()
-        seen_references = set()
+        entries = []
         for entry in rows:
             if not isinstance(entry, dict) or set(entry) != {"code", "counted", "reference"}:
                 raise ValueError("each row must be an object with code, counted and reference")
@@ -227,25 +222,88 @@ class StockRoom(JsonStore):
             counted = entry["counted"]
             if type(counted) is not int or counted < 0:
                 raise ValueError("counted must be a nonnegative integer")
+            entries.append({"code": code, "counted": counted, "reference": reference})
+        data = self._read()
+        records = self._plan_count_batch(data, entries)
+        counts = data.setdefault("counts", [])
+        movements = data.setdefault("movements", [])
+        for record in records:
+            counts.append(dict(record))
+            if record["difference"] != 0:
+                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return [dict(record) for record in records]
+
+    def import_counts_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 3 or set(header) != {"code", "counted", "reference"}:
+            raise ValueError("header must contain exactly the code, counted and reference columns")
+        positions = {name: header.index(name) for name in ("code", "counted", "reference")}
+        entries = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 3:
+                raise ValueError("each record must have exactly three columns")
+            code = row[positions["code"]].strip()
+            reference = row[positions["reference"]].strip()
+            counted_text = row[positions["counted"]].strip()
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            if not counted_text or any(char not in "0123456789" for char in counted_text):
+                raise ValueError("counted must be a nonnegative integer")
+            entries.append({"code": code, "counted": int(counted_text), "reference": reference})
+        if not entries:
+            return []
+        data = self._read()
+        records = self._plan_count_batch(data, entries)
+        counts = data.setdefault("counts", [])
+        movements = data.setdefault("movements", [])
+        for record in records:
+            counts.append(dict(record))
+            if record["difference"] != 0:
+                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return [dict(record) for record in records]
+
+    @staticmethod
+    def _plan_count_batch(data, entries):
+        # Shared count rules for count_batch and CSV imports: every entry is
+        # validated against the material list and the shared reference
+        # namespace before anything is written; before-stock is read from the
+        # committed ledger, so all records in one submission share one base.
+        materials = data.get("materials", {})
+        existing = data.get("movements", [])
+        records = []
+        seen_codes = set()
+        seen_references = set()
+        for entry in entries:
+            code = entry["code"]
+            reference = entry["reference"]
+            counted = entry["counted"]
             if code not in materials:
                 raise ValueError("unknown material")
             if code in seen_codes:
                 raise ValueError("material already exists in batch")
             if reference in seen_references:
                 raise ValueError("reference already exists")
-            self._require_unique_reference(data, reference)
+            StockRoom._require_unique_reference(data, reference)
             before = sum(row["quantity"] for row in existing if row["code"] == code)
             seen_codes.add(code)
             seen_references.add(reference)
-            parsed.append({"code": code, "reference": reference, "before": before, "counted": counted, "difference": counted - before})
-        counts = data.setdefault("counts", [])
-        movements = data.setdefault("movements", [])
-        for record in parsed:
-            counts.append(dict(record))
-            if record["difference"] != 0:
-                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
-        self._write(data)
-        return [dict(record) for record in parsed]
+            records.append({"code": code, "reference": reference, "before": before, "counted": counted, "difference": counted - before})
+        return records
 
     def counts(self, code):
         code = text(code, "code")
