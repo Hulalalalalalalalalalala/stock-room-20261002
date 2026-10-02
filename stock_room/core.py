@@ -386,10 +386,34 @@ class StockRoom(JsonStore):
         return self._purchase_snapshot(order)
 
     def receive_purchase(self, purchase_reference, rows):
+        data = self._read()
+        purchase_reference, planned = self._plan_purchase_receipts(data, purchase_reference, rows)
+        data.setdefault("movements", []).extend(
+            {"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]} for row in planned
+        )
+        data.setdefault("purchase_receipts", {}).setdefault(purchase_reference, []).extend(
+            self._receipt_record(row) for row in planned
+        )
+        self._write(data)
+        return [self._receipt_record(row) for row in planned]
+
+    def preview_purchase_receipts(self, purchase_reference, rows):
+        data = self._read()
+        _, planned = self._plan_purchase_receipts(data, purchase_reference, rows)
+        return [
+            {**self._receipt_record(row), "before": row["before"], "remaining": row["remaining"]}
+            for row in planned
+        ]
+
+    def _plan_purchase_receipts(self, data, purchase_reference, rows):
+        # Shared receipt rules for the receive and preview paths: each row is
+        # validated in input order against the purchase quota (history plus
+        # this batch), the shared per-material stock and the reference
+        # namespace. Nothing is written here; callers decide whether to
+        # commit the plan or just report it.
         purchase_reference = text(purchase_reference, "purchase_reference")
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
-        data = self._read()
         order = next((row for row in data.get("purchases", []) if row["reference"] == purchase_reference), None)
         if order is None:
             raise ValueError("unknown purchase reference")
@@ -404,7 +428,7 @@ class StockRoom(JsonStore):
         batch_received = {}
         seen_codes = set()
         seen_references = set()
-        parsed = []
+        planned = []
         for entry in rows:
             if not isinstance(entry, dict) or set(entry) != {"code", "quantity", "reference"}:
                 raise ValueError("each row must be an object with code, quantity and reference")
@@ -431,16 +455,24 @@ class StockRoom(JsonStore):
             self._require_unique_reference(data, reference)
             if code not in balances:
                 balances[code] = sum(row["quantity"] for row in existing if row["code"] == code)
-            balances[code] += quantity
+            before = balances[code]
+            balance = before + quantity
+            balances[code] = balance
             seen_codes.add(code)
             seen_references.add(reference)
-            parsed.append({"code": code, "quantity": quantity, "reference": reference, "balance": balances[code]})
-        data.setdefault("movements", []).extend(
-            {"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]} for row in parsed
-        )
-        data.setdefault("purchase_receipts", {}).setdefault(purchase_reference, []).extend(dict(row) for row in parsed)
-        self._write(data)
-        return parsed
+            planned.append({
+                "code": code,
+                "quantity": quantity,
+                "reference": reference,
+                "before": before,
+                "balance": balance,
+                "remaining": ordered[code]["quantity"] - received.get(code, 0) - batch_received[code],
+            })
+        return purchase_reference, planned
+
+    @staticmethod
+    def _receipt_record(record):
+        return {key: record[key] for key in ("code", "quantity", "reference", "balance")}
 
     def purchase_receipts(self, purchase_reference):
         purchase_reference = text(purchase_reference, "purchase_reference")
