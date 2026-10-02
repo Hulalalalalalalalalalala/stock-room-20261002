@@ -294,6 +294,44 @@ class StockRoom(JsonStore):
             self._write(data)
         return self._purchase_snapshot(order)
 
+    def update_purchase(self, reference, supplier, rows):
+        reference = text(reference, "reference")
+        supplier = text(supplier, "supplier")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        if order["status"] != "open":
+            raise ValueError("purchase is not open")
+        if data.get("purchase_receipts", {}).get(reference):
+            raise ValueError("purchase already has receipts")
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        seen = set()
+        parsed = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "quantity"}:
+                raise ValueError("each row must be an object with code and quantity")
+            code = text(entry["code"], "code")
+            quantity = entry["quantity"]
+            if type(quantity) is not int or quantity <= 0:
+                raise ValueError("quantity must be a positive integer")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+            if code in seen:
+                raise ValueError("material already exists in purchase")
+            seen.add(code)
+            material = materials[code]
+            parsed.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity})
+        order["supplier"] = supplier
+        order["rows"] = parsed
+        self._write(data)
+        return self._purchase_snapshot(order)
+
     def receive_purchase(self, purchase_reference, rows):
         purchase_reference = text(purchase_reference, "purchase_reference")
         if not isinstance(rows, list) or not rows:
