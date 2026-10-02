@@ -33,6 +33,11 @@ def text(value, label):
         raise ValueError(label + " must be a nonempty string")
     return value.strip()
 
+def optional_text(value, label):
+    if not isinstance(value, str):
+        raise ValueError(label + " must be a string")
+    return value.strip()
+
 def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")

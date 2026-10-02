@@ -1,4 +1,4 @@
-from .storage import JsonStore, text
+from .storage import JsonStore, text, optional_text
 
 class StockRoom(JsonStore):
     def register(self, code, name, unit):
@@ -594,6 +594,54 @@ class StockRoom(JsonStore):
             items.append(item)
         items.sort(key=lambda item: item["reference"])
         return items
+
+    def save_supplier(self, supplier, contact="", phone="", note=""):
+        supplier = text(supplier, "supplier")
+        contact = optional_text(contact, "contact")
+        phone = optional_text(phone, "phone")
+        note = optional_text(note, "note")
+        record = {"supplier": supplier, "contact": contact, "phone": phone, "note": note}
+        data = self._read()
+        profiles = data.setdefault("suppliers", {})
+        profiles[supplier] = record
+        self._write(data)
+        return dict(record)
+
+    def suppliers(self, keyword=""):
+        keyword = optional_text(keyword, "keyword")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        names = set(profiles)
+        for order in data.get("purchases", []):
+            names.add(order["supplier"])
+        items = []
+        for name in names:
+            if keyword and keyword not in name:
+                continue
+            profile = profiles.get(name)
+            if profile is None:
+                items.append({"supplier": name, "contact": "", "phone": "", "note": ""})
+            else:
+                items.append({field: profile.get(field, "") for field in ("supplier", "contact", "phone", "note")})
+        items.sort(key=lambda item: item["supplier"])
+        return items
+
+    def supplier_record(self, supplier):
+        supplier = text(supplier, "supplier")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        orders = [order for order in data.get("purchases", []) if order["supplier"] == supplier]
+        profile = profiles.get(supplier)
+        if profile is None and not orders:
+            raise ValueError("unknown supplier")
+        if profile is None:
+            record = {"supplier": supplier, "contact": "", "phone": "", "note": ""}
+        else:
+            record = {field: profile.get(field, "") for field in ("supplier", "contact", "phone", "note")}
+            record["supplier"] = supplier
+        purchases = [self._purchase_progress(data, order) for order in orders]
+        purchases.sort(key=lambda item: item["reference"])
+        return {**record, "purchases": purchases}
 
     def _purchase_progress(self, data, order):
         purchase_reference = order["reference"]
