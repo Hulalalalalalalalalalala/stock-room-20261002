@@ -1779,6 +1779,230 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual(StockRoom(self.root).purchase_order("PO-1")["status"], "open")
 
 
+class UpdatePurchaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.create_purchase("PO-1", " 甲 供应商 ", [
+            {"code": "PAPER", "quantity": 5},
+            {"code": "BOX", "quantity": 2},
+        ])
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body), encoding="utf-8")
+        return str(payload)
+
+    def test_fixed_sample_replaces_supplier_rows_and_order(self):
+        order = self.app.update_purchase(" PO-1 ", " 乙 供应商 ", [
+            {"code": "BOX", "quantity": 3},
+            {"code": "PAPER", "quantity": 8},
+        ])
+        self.assertEqual(order, {
+            "reference": "PO-1",
+            "supplier": "乙 供应商",
+            "status": "open",
+            "rows": [
+                {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 3},
+                {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 8},
+            ],
+        })
+        self.assertEqual(self.app.purchase_order("PO-1"), order)
+
+    def test_update_survives_reopen_with_new_order_and_progress(self):
+        self.app.update_purchase("PO-1", "乙 供应商", [
+            {"code": "BOX", "quantity": 3},
+            {"code": "PAPER", "quantity": 8},
+        ])
+        reopened = StockRoom(self.root)
+        order = reopened.purchase_order("PO-1")
+        self.assertEqual([row["code"] for row in order["rows"]], ["BOX", "PAPER"])
+        self.assertEqual([row["quantity"] for row in order["rows"]], [3, 8])
+        progress = reopened.purchase_progress("PO-1")
+        self.assertEqual(progress["progress"], "pending")
+        self.assertEqual([(row["code"], row["remaining"]) for row in progress["rows"]], [("BOX", 3), ("PAPER", 8)])
+        self.assertEqual(reopened.purchase_orders(supplier="乙 供应商")[0]["reference"], "PO-1")
+        self.assertEqual(reopened.purchase_orders(supplier="甲"), [])
+
+    def test_repeat_same_input_succeeds(self):
+        body = ("PO-1", "乙 供应商", [{"code": "BOX", "quantity": 3}, {"code": "PAPER", "quantity": 8}])
+        first = self.app.update_purchase(*body)
+        second = self.app.update_purchase(*body)
+        self.assertEqual(first, second)
+        self.assertEqual(len(StockRoom(self.root).purchase_orders()), 1)
+
+    def test_snapshot_refreshed_from_current_material_profile(self):
+        self.app.update_material("PAPER", "高级包装纸", "张")
+        self.app.update_purchase("PO-1", "乙 供应商", [{"code": "PAPER", "quantity": 8}])
+        self.assertEqual(self.app.purchase_order("PO-1")["rows"][0]["name"], "高级包装纸")
+        self.app.update_material("PAPER", "又改名了", "张")
+        self.assertEqual(self.app.purchase_order("PO-1")["rows"][0]["name"], "高级包装纸")
+
+    def test_update_can_add_remove_and_reorder_rows(self):
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.update_purchase("PO-1", "供应商", [
+            {"code": "TAPE", "quantity": 1},
+            {"code": "PAPER", "quantity": 5},
+        ])
+        order = self.app.purchase_order("PO-1")
+        self.assertEqual([row["code"] for row in order["rows"]], ["TAPE", "PAPER"])
+        # 被移除的 BOX 不能再按该单收货
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 1, "reference": "RCV-BOX"}])
+        received = self.app.receive_purchase("PO-1", [{"code": "TAPE", "quantity": 1, "reference": "RCV-1"}])
+        self.assertEqual(received[0]["code"], "TAPE")
+
+    def test_unknown_cancelled_and_received_purchases_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("MISSING", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.cancel_purchase("PO-1")
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.create_purchase("PO-2", "供应商", [{"code": "PAPER", "quantity": 5}])
+        self.app.receive_purchase("PO-2", [{"code": "PAPER", "quantity": 5, "reference": "RCV-2"}])
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("PO-2", "供应商", [{"code": "PAPER", "quantity": 9}])
+        # 全部退货后仍然锁定
+        self.app.return_purchase("RCV-2", 5, "RET-2")
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("PO-2", "供应商", [{"code": "PAPER", "quantity": 9}])
+
+    def test_first_receipt_then_update_rejected(self):
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 1, "reference": "RCV-1"}])
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("PO-1", "乙 供应商", [
+                {"code": "BOX", "quantity": 3},
+                {"code": "PAPER", "quantity": 8},
+            ])
+        order = self.app.purchase_order("PO-1")
+        self.assertEqual(order["supplier"], "甲 供应商")
+        self.assertEqual([(row["code"], row["quantity"]) for row in order["rows"]], [("PAPER", 5), ("BOX", 2)])
+
+    def test_movements_counts_reversals_do_not_lock_update(self):
+        self.app.count("BOX", 1, "CNT-BOX")
+        self.app.movement("BOX", 4, "BOX-IN")
+        self.app.movement("BOX", -2, "BOX-OUT")
+        self.app.reverse("BOX-OUT", "REV-BOX")
+        order = self.app.update_purchase("PO-1", "乙 供应商", [{"code": "BOX", "quantity": 7}])
+        self.assertEqual(order["rows"], [{"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 7}])
+
+    def test_validation_failures_preserve_file(self):
+        before = self.app.path.read_bytes()
+        bad_rows = [
+            {"reference": "PO-1", "supplier": "供应商", "rows": []},
+            {"reference": "PO-1", "supplier": "供应商", "rows": "PAPER"},
+            {"reference": "PO-1", "supplier": "供应商", "rows": ["PAPER"]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER"}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": 1, "name": "x"}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "  ", "quantity": 1}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": True}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": 0}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": -1}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": 1.5}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": "1"}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "UNKNOWN", "quantity": 1}]},
+            {"reference": "PO-1", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": 1}, {"code": " PAPER ", "quantity": 2}]},
+            {"reference": "PO-1", "supplier": "  ", "rows": [{"code": "PAPER", "quantity": 1}]},
+            {"reference": "PO-1", "supplier": 1, "rows": [{"code": "PAPER", "quantity": 1}]},
+            {"reference": "", "supplier": "供应商", "rows": [{"code": "PAPER", "quantity": 1}]},
+        ]
+        for body in bad_rows:
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    self.app.update_purchase(**body)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_inactive_material_rejected(self):
+        self.app.set_active("BOX", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("PO-1", "供应商", [{"code": "BOX", "quantity": 1}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_failed_update_on_empty_directory_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.update_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_without_receipts_is_updateable(self):
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchase_receipts", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        order = StockRoom(self.root).update_purchase("PO-1", "乙 供应商", [{"code": "BOX", "quantity": 3}])
+        self.assertEqual(order["rows"], [{"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 3}])
+
+    def test_legacy_data_without_purchases_is_unknown(self):
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchases", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).update_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+
+    def test_update_leaves_stock_status_and_histories_untouched(self):
+        self.app.set_minimum("BOX", 2)
+        self.app.update_purchase("PO-1", "乙 供应商", [
+            {"code": "BOX", "quantity": 3},
+            {"code": "PAPER", "quantity": 8},
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(self.app.material_status("BOX")["active"], True)
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001", "OUT-001"])
+        self.assertEqual(len(self.app.purchase_receipts("PO-1")), 0)
+        self.assertEqual(len(self.app.purchase_returns("PO-1")), 0)
+        # 不占用出入库编号
+        record = self.app.movement("PAPER", 1, "PO-1")
+        self.assertEqual(record["balance"], 15)
+
+    def test_cli_update_success_and_failure(self):
+        payload = self.write_payload("update-po.json", {
+            "reference": "PO-1", "supplier": "乙 供应商",
+            "rows": [{"code": "BOX", "quantity": 3}, {"code": "PAPER", "quantity": 8}],
+        })
+        result = self.run_cli("update-purchase", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = json.loads(result.stdout)
+        self.assertEqual(updated["status"], "open")
+        self.assertEqual([row["code"] for row in updated["rows"]], ["BOX", "PAPER"])
+        query = self.write_payload("query.json", {"reference": "PO-1"})
+        result = self.run_cli("purchase-order", query)
+        self.assertEqual(json.loads(result.stdout), updated)
+        self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 1, "reference": "RCV-1"}])
+        bad = self.write_payload("bad-update-po.json", {
+            "reference": "PO-1", "supplier": "丙", "rows": [{"code": "PAPER", "quantity": 1}],
+        })
+        failed = self.run_cli("update-purchase", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+
+    def test_cli_update_array_keeps_earlier_success(self):
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 2}])
+        payload = self.write_payload("update-array.json", [
+            {"reference": "PO-1", "supplier": "乙", "rows": [{"code": "BOX", "quantity": 3}]},
+            {"reference": "PO-2", "supplier": "丙", "rows": [{"code": "UNKNOWN", "quantity": 1}]},
+        ])
+        result = self.run_cli("update-purchase", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        order = self.app.purchase_order("PO-1")
+        self.assertEqual(order["supplier"], "乙")
+        self.assertEqual(order["rows"], [{"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 3}])
+        self.assertEqual(self.app.purchase_order("PO-2")["supplier"], "供应商")
+
+
 class PurchaseReceiptTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
