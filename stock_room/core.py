@@ -667,6 +667,59 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def replenishment_plan(self, keyword=""):
+        if not isinstance(keyword, str):
+            raise ValueError("keyword must be a string")
+        keyword = keyword.strip()
+        data = self._read()
+        rows = data.get("movements", [])
+        minimums = data.get("minimums", {})
+        status = data.get("status", {})
+        materials = data.get("materials", {})
+        selected = {}
+        for code, material in materials.items():
+            if not status.get(code, True):
+                continue
+            if keyword and keyword not in code and keyword not in material["name"]:
+                continue
+            quantity = sum(row["quantity"] for row in rows if row["code"] == code)
+            minimum = minimums.get(code, 0)
+            if quantity < minimum:
+                selected[code] = (material, quantity, minimum)
+        sources = {code: [] for code in selected}
+        for order in data.get("purchases", []):
+            if order.get("status") != "open":
+                continue
+            received = self._received_totals(data, order["reference"])
+            for line in order.get("rows", []):
+                code = line["code"]
+                if code not in selected:
+                    continue
+                remaining = line["quantity"] - received.get(code, 0)
+                if remaining <= 0:
+                    continue
+                if line["unit"] != selected[code][0]["unit"]:
+                    raise ValueError("purchase unit differs from the current material unit")
+                sources[code].append({"reference": order["reference"], "supplier": order["supplier"], "remaining": remaining})
+        items = []
+        for code, (material, quantity, minimum) in selected.items():
+            purchases = sorted(sources[code], key=lambda item: item["reference"])
+            incoming = sum(item["remaining"] for item in purchases)
+            shortage = minimum - quantity
+            items.append({
+                "code": code,
+                "name": material["name"],
+                "unit": material["unit"],
+                "quantity": quantity,
+                "minimum": minimum,
+                "shortage": shortage,
+                "incoming": incoming,
+                "suggested": max(shortage - incoming, 0),
+                "purchases": purchases,
+            })
+        items.sort(key=lambda item: item["code"])
+        return items
+
     @staticmethod
     def _require_unique_reference(data, reference):
         if any(row["reference"] == reference for row in data.get("movements", [])):
