@@ -5187,3 +5187,171 @@ class PurchaseChangeTests(unittest.TestCase):
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("error", json.loads(result.stderr))
+
+class AdjustPurchaseQuantitiesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "纸张", "张")
+        self.app.register("BOX", "箱子", "个")
+        self.app.create_purchase("P1", "甲", [
+            {"code": "PAPER", "quantity": 10}, {"code": "BOX", "quantity": 5},
+        ])
+
+    def order(self, paper=10, box=5, supplier="甲", status="open"):
+        return {"reference": "P1", "supplier": supplier, "status": status, "rows": [
+            {"code": "PAPER", "name": "纸张", "unit": "张", "quantity": paper},
+            {"code": "BOX", "name": "箱子", "unit": "个", "quantity": box},
+        ]}
+
+    def test_adjust_partial_rows_preserves_everything_else_and_persists(self):
+        result = self.app.adjust_purchase_quantities(" P1 ", [{"code": " PAPER ", "quantity": 8}])
+        self.assertEqual(result, self.order(paper=8))
+        self.assertEqual(StockRoom(self.root).purchase_order("P1"), self.order(paper=8))
+        changes = StockRoom(self.root).purchase_changes("P1")
+        self.assertEqual(len(changes), 1)
+        change = changes[0]
+        self.assertEqual((change["sequence"], change["action"]), (1, "adjust_purchase_quantities"))
+        self.assertEqual(change["before"], self.order(paper=10))
+        self.assertEqual(change["after"], self.order(paper=8))
+
+    def test_fixed_scenario_receipt_six_return_two_then_atomic_failure(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        self.app.return_purchase("RCV1", 2, "RET1")
+        self.assertEqual(self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}]),
+                         self.order(paper=8))
+        row = {line["code"]: line for line in self.app.purchase_progress("P1")["rows"]}["PAPER"]
+        self.assertEqual((row["received"], row["returned"], row["net_received"], row["remaining"]), (6, 2, 4, 2))
+        # Multi-row request with one invalid row fails as a whole; bytes unchanged.
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [
+                {"code": "BOX", "quantity": 3}, {"code": "PAPER", "quantity": 5},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.purchase_order("P1"), self.order(paper=8, box=5))
+        self.assertEqual(len(self.app.purchase_changes("P1")), 1)
+
+    def test_floor_is_gross_receipts_ignoring_returns_movements_counts_reversals(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        self.app.return_purchase("RCV1", 6, "RET1")
+        self.app.movement("PAPER", 100, "M1")
+        self.app.count("PAPER", 0, "C1")
+        self.app.movement("BOX", 4, "M2")
+        self.app.reverse("M2", "REV1")
+        # Net stock of PAPER is 0 but gross receipts (6) still set the floor.
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 5}])
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 6}])
+        # Unreceived orders are freely adjustable; missing receipt links count as zero.
+        self.assertEqual(self.app.adjust_purchase_quantities("P1", [{"code": "BOX", "quantity": 1}]),
+                         self.order(paper=6, box=1))
+
+    def test_invalid_rows_and_values_rejected(self):
+        for rows in (None, [], "rows", 7, (), [[]], [None], [7],
+                     [{"quantity": 8}], [{"code": "PAPER"}],
+                     [{"code": "PAPER", "quantity": 8, "extra": 1}],
+                     [{"code": 9, "quantity": 8}], [{"code": "   ", "quantity": 8}],
+                     [{"code": "PAPER", "quantity": True}],
+                     [{"code": "PAPER", "quantity": 1.0}],
+                     [{"code": "PAPER", "quantity": "8"}],
+                     [{"code": "PAPER", "quantity": 0}],
+                     [{"code": "PAPER", "quantity": -3}]):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.adjust_purchase_quantities("P1", rows)
+        for reference in (None, 11, True, "", "   ", ["P1"]):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.adjust_purchase_quantities(reference, [{"code": "PAPER", "quantity": 8}])
+
+    def test_unknown_cancelled_missing_code_duplicate_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("UNKNOWN", [{"code": "PAPER", "quantity": 8}])
+        self.app.create_purchase("P2", "甲", [{"code": "PAPER", "quantity": 3}])
+        self.app.cancel_purchase("P2")
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P2", [{"code": "PAPER", "quantity": 4}])
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [{"code": "INK", "quantity": 4}])
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [{"code": "paper", "quantity": 4}])
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [
+                {"code": "PAPER", "quantity": 9}, {"code": " PAPER ", "quantity": 7},
+            ])
+
+    def test_inactive_and_updated_material_do_not_block_or_refresh_snapshot(self):
+        self.app.set_active("BOX", False)
+        self.app.adjust_purchase_quantities("P1", [{"code": "BOX", "quantity": 9}])
+        self.app.update_material("PAPER", "复印纸", "张")
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        rows = {line["code"]: line for line in self.app.purchase_order("P1")["rows"]}
+        self.assertEqual(rows["BOX"]["quantity"], 9)
+        # Snapshot names are untouched by the adjustment.
+        self.assertEqual(rows["PAPER"]["name"], "纸张")
+        self.assertEqual(rows["PAPER"]["unit"], "张")
+
+    def test_repeat_submission_returns_same_order_without_writing_or_history(self):
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        before = self.app.path.read_bytes()
+        again = self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        self.assertEqual(again, self.order(paper=8))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.purchase_changes("P1")), 1)
+
+    def test_failed_adjustment_keeps_bytes_and_empty_dir_creates_no_file(self):
+        before = self.app.path.read_bytes()
+        for rows in ([{"code": "PAPER", "quantity": 0}], [{"code": "GHOST", "quantity": 1}],
+                     [{"code": "PAPER", "quantity": 9}, {"code": "PAPER", "quantity": 8}]):
+            with self.assertRaises(ValueError):
+                self.app.adjust_purchase_quantities("P1", rows)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = Path(self.temp.name) / "empty"
+        fresh = StockRoom(empty)
+        for kwargs in ({"reference": "P1", "rows": []},
+                       {"reference": 11, "rows": [{"code": "PAPER", "quantity": 1}]},
+                       {"reference": "P1", "rows": [{"code": "PAPER", "quantity": 1}]}):
+            with self.assertRaises(ValueError):
+                fresh.adjust_purchase_quantities(**kwargs)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_new_quantities_feed_progress_export_replenishment_and_receipt_limit(self):
+        self.app.set_minimum("PAPER", 20)
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        plan = {item["code"]: item for item in self.app.replenishment_plan()}
+        self.assertEqual(plan["PAPER"]["incoming"], 8)
+        self.assertEqual(plan["PAPER"]["purchases"][0]["remaining"], 8)
+        exported = [line for line in self.app.export_purchases_csv().splitlines() if line.startswith("P1,")]
+        self.assertEqual(exported[0].split(",")[7], "8")
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 8, "reference": "RCV1"}])
+        paper_row = {line["code"]: line for line in self.app.purchase_progress("P1")["rows"]}["PAPER"]
+        self.assertEqual((paper_row["received"], paper_row["remaining"]), (8, 0))
+        # No room left under the adjusted ordered quantity.
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 1, "reference": "RCV2"}])
+
+    def test_update_purchase_still_locked_after_receipt_but_adjustment_available(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("P1", "甲", [{"code": "PAPER", "quantity": 12}])
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 12}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV2"}])
+
+    def test_cli_adjust_success_and_failure(self):
+        payload = self.root / "adjust.json"
+        payload.write_text(json.dumps({"reference": "P1", "rows": [{"code": "PAPER", "quantity": 8}]}),
+                           encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root),
+                             "adjust-purchase-quantities", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["rows"][0]["quantity"], 8)
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"reference": "P1", "rows": [{"code": "PAPER", "quantity": 0}]}),
+                       encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root),
+                                 "adjust-purchase-quantities", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))

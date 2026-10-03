@@ -724,6 +724,45 @@ class StockRoom(JsonStore):
         self._write(data)
         return self._purchase_snapshot(order)
 
+    def adjust_purchase_quantities(self, reference, rows):
+        reference = text(reference, "reference")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        if order["status"] == "cancelled":
+            raise ValueError("purchase is cancelled")
+        ordered = {line["code"]: line for line in order["rows"]}
+        received = self._received_totals(data, reference)
+        changes = {}
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "quantity"}:
+                raise ValueError("each row must be an object with code and quantity")
+            code = text(entry["code"], "code")
+            quantity = entry["quantity"]
+            if type(quantity) is not int or quantity <= 0:
+                raise ValueError("quantity must be a positive integer")
+            if code not in ordered:
+                raise ValueError("material is not part of the purchase")
+            if quantity < received.get(code, 0):
+                raise ValueError("ordered quantity cannot be below the received quantity")
+            if code in changes:
+                raise ValueError("material already exists in adjustment")
+            changes[code] = quantity
+        before = self._purchase_snapshot(order)
+        for code, quantity in changes.items():
+            ordered[code]["quantity"] = quantity
+        self._record_purchase_change(data, order, "adjust_purchase_quantities", before)
+        # Repeat submissions must leave the stored bytes untouched; the change
+        # recorder appends nothing when the snapshot is unchanged, so the write
+        # can be skipped wholesale in that case.
+        after = self._purchase_snapshot(order)
+        if before != after:
+            self._write(data)
+        return after
+
     def receive_purchase(self, purchase_reference, rows):
         purchase_reference = text(purchase_reference, "purchase_reference")
         if not isinstance(rows, list) or not rows:
