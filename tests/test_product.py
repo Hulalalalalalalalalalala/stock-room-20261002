@@ -4738,3 +4738,219 @@ class MaterialChangeTests(unittest.TestCase):
         self.assertEqual(len(changes), 1)
         self.assertEqual(changes[0]["after"]["active"], False)
         self.assertEqual(self.app.material_status("BOX")["active"], False)
+
+class PurchaseChangeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "纸张", "包")
+        self.app.register("INK", "墨水", "瓶")
+        self.app.save_supplier("乙", "李", "123", "备注")
+        self.app.create_purchase("P1", "甲", [{"code": "PAPER", "quantity": 10}])
+
+    def order(self, supplier="甲", status="open", rows=None):
+        if rows is None:
+            rows = [{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 10}]
+        return {"reference": "P1", "supplier": supplier, "status": status, "rows": rows}
+
+    def test_fixed_scenario_update_repeat_cancel_repeat_merge_yields_three_records(self):
+        self.app.update_purchase(" P1 ", "甲", [{"code": "PAPER", "quantity": 8}])
+        self.app.update_purchase("P1", "甲", [{"code": "PAPER", "quantity": 8}])
+        self.app.cancel_purchase("P1")
+        self.app.cancel_purchase("P1")
+        changes = StockRoom(self.root).purchase_changes("P1")
+        self.assertEqual([c["sequence"] for c in changes], [1, 2])
+        self.assertEqual([c["action"] for c in changes], ["update_purchase", "cancel_purchase"])
+        self.app.merge_supplier("甲", "乙")
+        changes = StockRoom(self.root).purchase_changes("P1")
+        self.assertEqual([c["sequence"] for c in changes], [1, 2, 3])
+        self.assertEqual([c["action"] for c in changes], ["update_purchase", "cancel_purchase", "merge_supplier"])
+        self.assertEqual(changes[0]["before"], self.order(rows=[{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 10}]))
+        self.assertEqual(changes[0]["after"], self.order(rows=[{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 8}]))
+        eight = self.order(status="cancelled", rows=[{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 8}])
+        self.assertEqual(changes[1]["before"], self.order(rows=[{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 8}]))
+        self.assertEqual(changes[1]["after"], eight)
+        self.assertEqual(changes[2]["before"], eight)
+        self.assertEqual(changes[2]["after"], self.order(supplier="乙", status="cancelled", rows=[{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 8}]))
+        for change in changes:
+            self.assertEqual(set(change), {"reference", "sequence", "action", "before", "after"})
+            self.assertEqual(change["reference"], "P1")
+
+    def test_empty_history_for_existing_order_including_cancelled(self):
+        self.assertEqual(self.app.purchase_changes("P1"), [])
+        self.app.cancel_purchase("P1")
+        self.assertEqual(len(StockRoom(self.root).purchase_changes("P1")), 1)
+        self.assertEqual(len(StockRoom(self.root).purchase_changes(" P1 ")), 1)
+
+    def test_invalid_reference_arguments_rejected(self):
+        for reference in ("", "   ", 11, None, True, ["P1"]):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.purchase_changes(reference)
+        with self.assertRaises(ValueError):
+            self.app.purchase_changes("p1")
+        with self.assertRaises(ValueError):
+            self.app.purchase_changes("P 1")
+        with self.assertRaises(ValueError):
+            self.app.purchase_changes("UNKNOWN")
+
+    def test_case_sensitive_reference_with_inner_whitespace(self):
+        self.app.create_purchase("A 1", "甲", [{"code": "PAPER", "quantity": 1}])
+        self.app.update_purchase("A 1", "甲", [{"code": "PAPER", "quantity": 2}])
+        self.assertEqual(self.app.purchase_changes("A 1")[0]["reference"], "A 1")
+        # Leading/trailing whitespace is trimmed before matching; inner
+        # whitespace and letter case are part of the identity.
+        self.assertEqual(self.app.purchase_changes("  A 1  ")[0]["reference"], "A 1")
+        for bad in ("A1", "a 1", "A  1"):
+            with self.assertRaises(ValueError):
+                self.app.purchase_changes(bad)
+
+    def test_row_count_order_and_refreshed_snapshot_all_recorded_once(self):
+        self.app.create_purchase("M1", "甲", [
+            {"code": "PAPER", "quantity": 1}, {"code": "INK", "quantity": 2},
+        ])
+        # Quantity + supplier + row reorder in one call: a single record.
+        self.app.update_purchase("M1", "乙", [
+            {"code": "INK", "quantity": 4}, {"code": "PAPER", "quantity": 1},
+        ])
+        changes = self.app.purchase_changes("M1")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual([r["code"] for r in changes[0]["before"]["rows"]], ["PAPER", "INK"])
+        self.assertEqual([r["code"] for r in changes[0]["after"]["rows"]], ["INK", "PAPER"])
+        self.assertEqual(changes[0]["before"]["supplier"], "甲")
+        self.assertEqual(changes[0]["after"]["supplier"], "乙")
+        self.assertEqual(changes[0]["after"]["rows"][0]["quantity"], 4)
+        # A material rename refreshes the name snapshot on an identical re-submission.
+        self.app.update_material("PAPER", "复印纸", "包")
+        self.app.update_purchase("M1", "乙", [
+            {"code": "INK", "quantity": 4}, {"code": "PAPER", "quantity": 1},
+        ])
+        changes = self.app.purchase_changes("M1")
+        self.assertEqual(len(changes), 2)
+        self.assertEqual(changes[1]["before"]["rows"][1]["name"], "纸张")
+        self.assertEqual(changes[1]["after"]["rows"][1]["name"], "复印纸")
+        # Unit snapshot refresh counts too.
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.create_purchase("M2", "甲", [{"code": "TAPE", "quantity": 1}])
+        self.app.update_material("TAPE", "胶带", "筒")
+        self.app.update_purchase("M2", "甲", [{"code": "TAPE", "quantity": 1}])
+        unit_change = self.app.purchase_changes("M2")
+        self.assertEqual(len(unit_change), 1)
+        self.assertEqual(unit_change[0]["before"]["rows"][0]["unit"], "卷")
+        self.assertEqual(unit_change[0]["after"]["rows"][0]["unit"], "筒")
+
+    def test_merge_records_each_migrated_order_including_cancelled_and_received(self):
+        self.app.create_purchase("R1", "甲", [{"code": "PAPER", "quantity": 5}])
+        self.app.receive_purchase("R1", [{"code": "PAPER", "quantity": 5, "reference": "RCV1"}])
+        self.app.return_purchase("RCV1", 2, "RET1")
+        self.app.create_purchase("R2", "甲", [{"code": "INK", "quantity": 3}])
+        self.app.cancel_purchase("R2")
+        self.app.create_purchase("T1", "乙", [{"code": "INK", "quantity": 1}])
+        self.app.merge_supplier("甲", "乙")
+        r1 = StockRoom(self.root).purchase_changes("R1")
+        self.assertEqual([c["action"] for c in r1], ["merge_supplier"])
+        self.assertEqual(r1[0]["before"]["supplier"], "甲")
+        self.assertEqual(r1[0]["after"]["supplier"], "乙")
+        r2 = StockRoom(self.root).purchase_changes("R2")
+        self.assertEqual([(c["sequence"], c["action"]) for c in r2], [(1, "cancel_purchase"), (2, "merge_supplier")])
+        self.assertEqual(r2[1]["before"]["status"], "cancelled")
+        # Target's pre-existing order is not recorded.
+        self.assertEqual(StockRoom(self.root).purchase_changes("T1"), [])
+
+    def test_create_import_receive_return_save_supplier_add_no_records(self):
+        self.app.import_purchases_csv("reference,supplier,code,quantity\nI1,甲,PAPER,3\n")
+        self.app.receive_purchase("I1", [{"code": "PAPER", "quantity": 2, "reference": "RCV2"}])
+        self.app.return_purchase("RCV2", 1, "RET2")
+        self.app.save_supplier("甲", "联系人", "9", "x")
+        self.assertEqual(self.app.purchase_changes("I1"), [])
+        self.assertEqual(self.app.purchase_changes("P1"), [])
+
+    def test_failed_modifications_append_nothing_and_keep_bytes(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("UNKNOWN", "甲", [{"code": "PAPER", "quantity": 1}])
+        with self.assertRaises(ValueError):
+            self.app.update_purchase("P1", "甲", [{"code": "GHOST", "quantity": 1}])
+        with self.assertRaises(ValueError):
+            self.app.cancel_purchase("UNKNOWN")
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("幽灵", "乙")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.purchase_changes("P1"), [])
+
+    def test_query_success_and_failure_do_not_modify_file_and_no_file_created(self):
+        self.app.update_purchase("P1", "甲", [{"code": "PAPER", "quantity": 8}])
+        before = self.app.path.read_bytes()
+        self.app.purchase_changes("P1")
+        with self.assertRaises(ValueError):
+            self.app.purchase_changes("UNKNOWN")
+        self.assertEqual(before, self.app.path.read_bytes())
+        empty = Path(self.temp.name) / "empty"
+        empty_app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            empty_app.purchase_changes("P1")
+        with self.assertRaises(ValueError):
+            empty_app.purchase_changes(11)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_without_history_treated_as_empty_first_before_is_actual(self):
+        legacy = Path(self.temp.name) / "legacy"
+        legacy.mkdir()
+        payload = {"materials": {"PAPER": {"code": "PAPER", "name": "纸张", "unit": "包"}},
+                   "purchases": [{
+            "reference": "L1", "supplier": "s", "status": "open",
+            "rows": [{"code": "PAPER", "name": "纸张", "unit": "包", "quantity": 7}],
+        }]}
+        (legacy / "data.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        app = StockRoom(legacy)
+        self.assertEqual(app.purchase_changes("L1"), [])
+        app.update_purchase("L1", "s", [{"code": "PAPER", "quantity": 6}])
+        changes = StockRoom(legacy).purchase_changes("L1")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["sequence"], 1)
+        self.assertEqual(changes[0]["before"]["rows"][0]["quantity"], 7)
+        self.assertEqual(changes[0]["after"]["rows"][0]["quantity"], 6)
+
+    def test_returned_snapshots_are_independent_copies(self):
+        self.app.update_purchase("P1", "甲", [{"code": "PAPER", "quantity": 8}])
+        changes = self.app.purchase_changes("P1")
+        changes[0]["action"] = "tampered"
+        changes[0]["after"]["supplier"] = "ZZ"
+        changes[0]["after"]["rows"][0]["quantity"] = 999
+        fresh = self.app.purchase_changes("P1")
+        self.assertEqual(fresh[0]["action"], "update_purchase")
+        self.assertEqual(fresh[0]["after"]["supplier"], "甲")
+        self.assertEqual(fresh[0]["after"]["rows"][0]["quantity"], 8)
+
+    def test_later_business_does_not_rewrite_saved_history(self):
+        self.app.update_purchase("P1", "甲", [{"code": "PAPER", "quantity": 8}])
+        first = json.dumps(self.app.purchase_changes("P1"), ensure_ascii=False)
+        self.app.cancel_purchase("P1")
+        self.app.merge_supplier("甲", "乙")
+        history = self.app.purchase_changes("P1")
+        self.assertEqual(json.dumps(history[:1], ensure_ascii=False), first)
+        self.assertEqual(history[1]["after"], history[2]["before"])
+
+    def test_cli_query_success_failure_and_array_processing(self):
+        self.app.update_purchase("P1", "甲", [{"code": "PAPER", "quantity": 8}])
+        query = self.root / "query.json"
+        query.write_text(json.dumps({"reference": "P1"}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "purchase-changes", str(query)],
+                            text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(len(json.loads(ok.stdout)), 1)
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"reference": "UNKNOWN"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "purchase-changes", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        # JSON array: items handled independently.
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([{"reference": "P1"}, {"reference": "UNKNOWN"}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "purchase-changes", str(batch)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
