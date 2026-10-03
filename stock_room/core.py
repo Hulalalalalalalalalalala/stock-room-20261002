@@ -716,6 +716,54 @@ class StockRoom(JsonStore):
         self._write(data)
         return [{**self._receipt_record(row), "purchase_reference": row["purchase_reference"]} for row in planned]
 
+    def import_purchase_receipts_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 4 or set(header) != {"purchase_reference", "code", "quantity", "reference"}:
+            raise ValueError("header must contain exactly the purchase_reference, code, quantity and reference columns")
+        positions = {name: header.index(name) for name in ("purchase_reference", "code", "quantity", "reference")}
+        entries = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 4:
+                raise ValueError("each record must have exactly four columns")
+            purchase_reference = row[positions["purchase_reference"]].strip()
+            code = row[positions["code"]].strip()
+            reference = row[positions["reference"]].strip()
+            quantity_text = row[positions["quantity"]].strip()
+            if not purchase_reference:
+                raise ValueError("purchase_reference must be a nonempty string")
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            if not quantity_text or any(char < "0" or char > "9" for char in quantity_text):
+                raise ValueError("quantity must be a positive integer")
+            quantity = int(quantity_text)
+            if quantity == 0:
+                raise ValueError("quantity must be a positive integer")
+            entries.append({"purchase_reference": purchase_reference, "code": code, "quantity": quantity, "reference": reference})
+        if not entries:
+            return []
+        data = self._read()
+        planned = self._plan_purchase_receipt_batch(data, entries)
+        movements = data.setdefault("movements", [])
+        receipts = data.setdefault("purchase_receipts", {})
+        for row in planned:
+            movements.append({"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]})
+            receipts.setdefault(row["purchase_reference"], []).append(self._receipt_record(row))
+        self._write(data)
+        return [{**self._receipt_record(row), "purchase_reference": row["purchase_reference"]} for row in planned]
+
     def _plan_purchase_receipt_batch(self, data, rows):
         # Cross-purchase counterpart of _plan_purchase_receipts: each row
         # carries its own purchase reference and is validated in input order
