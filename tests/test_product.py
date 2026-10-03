@@ -4169,3 +4169,395 @@ class ReceivePurchaseBatchTests(unittest.TestCase):
         self.assertEqual(self.app.stock("BOX")["quantity"], 1)
         self.assertEqual([row["reference"] for row in self.app.purchase_receipts("P1")], ["RCV-1"])
         self.assertEqual(self.app.purchase_receipts("P2"), [])
+
+
+def seed_beichen_merge(app):
+    # Fixed sample for supplier merge regression: BOX (纸箱/个, minimum 10),
+    # two supplier profiles and four purchases with mixed receipt/cancel state.
+    app.register("BOX", "纸箱", "个")
+    app.set_minimum("BOX", 10)
+    app.save_supplier("北辰旧名", contact="张", phone="123", note="旧档")
+    app.save_supplier("北辰", contact="李", phone="", note="保留")
+    app.create_purchase("P1", "北辰旧名", [{"code": "BOX", "quantity": 7}])
+    app.receive_purchase("P1", [{"code": "BOX", "quantity": 3, "reference": "RCV-1"}])
+    app.return_purchase("RCV-1", 1, "RET-1")
+    app.create_purchase("P3", "北辰旧名", [{"code": "BOX", "quantity": 2}])
+    app.cancel_purchase("P3")
+    app.create_purchase("P2", "北辰", [{"code": "BOX", "quantity": 5}])
+    app.create_purchase("P4", "北辰包装", [{"code": "BOX", "quantity": 1}])
+
+
+class MergeSupplierTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        seed_beichen_merge(self.app)
+
+    def order_refs(self, record):
+        return [order["reference"] for order in record["purchases"]]
+
+    def test_fixed_sample_merge_contacts_orders_stats_and_reopen(self):
+        before_suppliers = {item["supplier"]: item for item in self.app.suppliers()}
+        self.assertEqual(list(before_suppliers), ["北辰", "北辰包装", "北辰旧名"])
+        self.assertEqual([item["reference"] for item in self.app.purchase_orders(supplier="北辰旧名")], ["P1", "P3"])
+        plan_before = self.app.replenishment_plan()[0]
+        self.assertEqual(
+            [(item["reference"], item["supplier"], item["remaining"]) for item in plan_before["purchases"]],
+            [("P1", "北辰旧名", 4), ("P2", "北辰", 5), ("P4", "北辰包装", 1)],
+        )
+
+        # Names are located after trimming surrounding whitespace.
+        merged = self.app.merge_supplier("  北辰旧名  ", "  北辰  ")
+        record = self.app.supplier_record("北辰")
+        self.assertEqual(merged, record)
+        self.assertEqual(list(merged), ["supplier", "contact", "phone", "note", "purchases"])
+        self.assertEqual(
+            {key: merged[key] for key in ("supplier", "contact", "phone", "note")},
+            {"supplier": "北辰", "contact": "李", "phone": "123", "note": "保留"},
+        )
+        self.assertEqual(self.order_refs(merged), ["P1", "P2", "P3"])
+        by_ref = {order["reference"]: order for order in merged["purchases"]}
+        p1, p2, p3 = by_ref["P1"], by_ref["P2"], by_ref["P3"]
+        self.assertEqual(p1["supplier"], "北辰")
+        self.assertEqual(p1["status"], "open")
+        self.assertEqual(p1["progress"], "partial")
+        self.assertEqual(p1["rows"], [{
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 7,
+            "received": 3, "returned": 1, "net_received": 2, "remaining": 4,
+        }])
+        self.assertEqual(p2["status"], "open")
+        self.assertEqual(p2["progress"], "pending")
+        self.assertEqual(p2["rows"][0]["received"], 0)
+        self.assertEqual(p2["rows"][0]["remaining"], 5)
+        self.assertEqual(p3["status"], "cancelled")
+        self.assertEqual(p3["progress"], "pending")
+        self.assertEqual(p3["rows"][0]["remaining"], 2)
+
+        # The similar supplier and its purchase stay untouched.
+        packaging = self.app.supplier_record("北辰包装")
+        self.assertEqual(
+            {key: packaging[key] for key in ("contact", "phone", "note")},
+            {"contact": "", "phone": "", "note": ""},
+        )
+        self.assertEqual(self.order_refs(packaging), ["P4"])
+        self.assertEqual(self.app.purchase_order("P4")["supplier"], "北辰包装")
+        self.assertEqual(packaging["purchases"][0]["progress"], "pending")
+        self.assertEqual(packaging["purchases"][0]["rows"][0], {
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 1,
+            "received": 0, "returned": 0, "net_received": 0, "remaining": 1,
+        })
+
+        # Stock, material profile, minimum, snapshot, row order and every
+        # receipt/return record are unchanged.
+        self.assertEqual(self.app.stock("BOX"), {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 2})
+        self.assertEqual(self.app.material_status("BOX"), {"code": "BOX", "active": True})
+        self.assertEqual(self.app.shortages(), [
+            {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 2, "minimum": 10, "shortage": 8},
+        ])
+        self.assertEqual(self.app.purchase_order("P1")["rows"], [
+            {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 7},
+        ])
+        self.assertEqual(self.app.purchase_receipts("P1"), [
+            {"code": "BOX", "quantity": 3, "reference": "RCV-1", "balance": 3},
+        ])
+        self.assertEqual(self.app.purchase_returns("P1"), [
+            {"purchase_reference": "P1", "receipt_reference": "RCV-1", "code": "BOX",
+             "quantity": 1, "reference": "RET-1", "balance": 2},
+        ])
+        self.assertEqual(self.app.movement_ledger("BOX"), [
+            {"code": "BOX", "quantity": 3, "reference": "RCV-1", "before": 0, "balance": 3,
+             "kind": "purchase_receipt", "purchase_reference": "P1", "related_reference": None},
+            {"code": "BOX", "quantity": -1, "reference": "RET-1", "before": 3, "balance": 2,
+             "kind": "purchase_return", "purchase_reference": "P1", "related_reference": "RCV-1"},
+        ])
+
+        # Purchase filters and replenishment sources show migrated orders under the new name.
+        self.assertEqual(self.app.purchase_orders(supplier="北辰旧名"), [])
+        self.assertEqual(
+            [item["reference"] for item in self.app.purchase_orders(supplier="北辰", status="cancelled")],
+            ["P3"],
+        )
+        self.assertEqual(
+            [item["reference"] for item in self.app.purchase_orders(supplier="北辰", progress="partial")],
+            ["P1"],
+        )
+        plan_after = self.app.replenishment_plan()[0]
+        self.assertEqual((plan_after["quantity"], plan_after["minimum"], plan_after["shortage"]), (2, 10, 8))
+        self.assertEqual((plan_after["incoming"], plan_after["suggested"]), (10, 0))
+        self.assertEqual(
+            [(item["reference"], item["supplier"], item["remaining"]) for item in plan_after["purchases"]],
+            [("P1", "北辰", 4), ("P2", "北辰", 5), ("P4", "北辰包装", 1)],
+        )
+
+        # The old name is gone from the list and exact lookup.
+        self.assertEqual([item["supplier"] for item in self.app.suppliers()], ["北辰", "北辰包装"])
+        self.assertEqual([item["supplier"] for item in self.app.suppliers(keyword="北辰")], ["北辰", "北辰包装"])
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("北辰旧名")
+
+        # Results survive reopening the same directory.
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.supplier_record("北辰"), record)
+        self.assertEqual([item["supplier"] for item in reopened.suppliers()], ["北辰", "北辰包装"])
+        with self.assertRaises(ValueError):
+            reopened.supplier_record("北辰旧名")
+        self.assertEqual(reopened.stock("BOX")["quantity"], 2)
+        self.assertEqual(reopened.purchase_progress("P1")["rows"][0]["net_received"], 2)
+
+    def test_merge_again_with_gone_source_fails_then_name_can_be_reused(self):
+        self.app.merge_supplier("北辰旧名", "北辰")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("北辰旧名", "北辰包装")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The old name may be re-established through the existing entries.
+        self.app.save_supplier("北辰旧名", contact="周", phone="", note="重建")
+        record = self.app.supplier_record("北辰旧名")
+        self.assertEqual((record["contact"], record["phone"], record["note"]), ("周", "", "重建"))
+        self.assertEqual(record["purchases"], [])
+        self.app.create_purchase("P5", "北辰旧名", [{"code": "BOX", "quantity": 6}])
+        self.assertEqual(
+            [order["reference"] for order in self.app.supplier_record("北辰旧名")["purchases"]],
+            ["P5"],
+        )
+        self.assertIn("北辰旧名", [item["supplier"] for item in self.app.suppliers()])
+
+    def test_only_one_side_has_profile(self):
+        self.app = StockRoom(self.root / "sided")
+        self.app.register("BOX", "纸箱", "个")
+        # Source profile only: target exists just through a purchase.
+        self.app.save_supplier("有档案", contact="赵", phone="9", note="N")
+        self.app.create_purchase("Q1", "仅采购", [{"code": "BOX", "quantity": 1}])
+        result = self.app.merge_supplier("有档案", "仅采购")
+        self.assertEqual(
+            {key: result[key] for key in ("contact", "phone", "note")},
+            {"contact": "赵", "phone": "9", "note": "N"},
+        )
+        self.assertEqual(self.order_refs(result), ["Q1"])
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("有档案")
+
+        # Target profile only: its values win and the source's empty fields
+        # never overwrite them.
+        self.app.save_supplier("留档方", contact="钱", phone="8", note="留")
+        self.app.create_purchase("Q2", "流动方", [{"code": "BOX", "quantity": 1}])
+        result = self.app.merge_supplier("流动方", "留档方")
+        self.assertEqual(
+            {key: result[key] for key in ("contact", "phone", "note")},
+            {"contact": "钱", "phone": "8", "note": "留"},
+        )
+        self.assertEqual(self.order_refs(result), ["Q2"])
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("流动方")
+
+    def test_neither_side_has_profile_creates_no_empty_profile(self):
+        app = StockRoom(self.root / "profileless")
+        app.register("BOX", "纸箱", "个")
+        app.create_purchase("R1", "无档甲", [{"code": "BOX", "quantity": 1}])
+        app.create_purchase("R2", "无档乙", [{"code": "BOX", "quantity": 2}])
+        result = app.merge_supplier("无档甲", "无档乙")
+        self.assertEqual(
+            {key: result[key] for key in ("contact", "phone", "note")},
+            {"contact": "", "phone": "", "note": ""},
+        )
+        self.assertEqual(self.order_refs(result), ["R1", "R2"])
+        data = json.loads(app.path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("suppliers", {}), {})
+        with self.assertRaises(ValueError):
+            app.supplier_record("无档甲")
+
+    def test_legacy_data_without_receipts_or_returns_counts_stats_as_zero(self):
+        # Old ledger with no receipts/returns collections: merge still migrates
+        # the order and progress stats are all computed as zero.
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        payload = {
+            "materials": {"BOX": {"code": "BOX", "name": "纸箱", "unit": "个"}},
+            "minimums": {"BOX": 10},
+            "purchases": [
+                {"reference": "L1", "supplier": "旧供应商", "status": "open",
+                 "rows": [{"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 7}]},
+            ],
+        }
+        (legacy / "data.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        old = StockRoom(legacy)
+        old.save_supplier("新供应商", contact="李", phone="123", note="保留")
+        merged = old.merge_supplier("旧供应商", "新供应商")
+        order = merged["purchases"][0]
+        self.assertEqual(order["reference"], "L1")
+        self.assertEqual(order["progress"], "pending")
+        self.assertEqual(order["rows"][0], {
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 7,
+            "received": 0, "returned": 0, "net_received": 0, "remaining": 7,
+        })
+        self.assertEqual((merged["contact"], merged["phone"], merged["note"]), ("李", "123", "保留"))
+        self.assertEqual(StockRoom(legacy).supplier_record("新供应商")["purchases"][0]["rows"][0]["net_received"], 0)
+
+
+class MergeSupplierValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        seed_beichen_merge(self.app)
+
+    def test_invalid_arguments_rejected_with_bytes_and_business_intact(self):
+        before = self.app.path.read_bytes()
+        invalid_pairs = [
+            (None, "北辰"), (123, "北辰"), ([], "北辰"), ({}, "北辰"),
+            ("北辰旧名", None), ("北辰旧名", 123), ("北辰旧名", []), ("北辰旧名", {}),
+            ("", "北辰"), ("   ", "北辰"), ("\t\n", "北辰"),
+            ("北辰旧名", ""), ("北辰旧名", "   "),
+            ("幽灵", "北辰"), ("北辰旧名", "幽灵"),
+            ("北辰", "  北辰  "), ("北辰旧名", "北辰旧名"),
+        ]
+        for source, target in invalid_pairs:
+            with self.subTest(source=source, target=target):
+                with self.assertRaises(ValueError):
+                    self.app.merge_supplier(source, target)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # All business results stay exactly as seeded after every rejection.
+        self.assertEqual([item["supplier"] for item in self.app.suppliers()],
+                         ["北辰", "北辰包装", "北辰旧名"])
+        self.assertEqual(self.app.stock("BOX")["quantity"], 2)
+        self.assertEqual(self.app.purchase_order("P1")["supplier"], "北辰旧名")
+        self.assertEqual(self.app.purchase_receipts("P1")[0]["quantity"], 3)
+        self.assertEqual(self.app.purchase_returns("P1")[0]["quantity"], 1)
+        self.assertEqual(self.app.purchase_progress("P3")["status"], "cancelled")
+
+    def test_failed_merge_on_empty_directory_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        for source, target in [
+            (None, "A"), ("A", None), ("", "A"), ("A", "  "),
+            ("A", "A"), ("  A ", "A"), ("A", "B"),
+        ]:
+            with self.subTest(source=source, target=target):
+                with self.assertRaises(ValueError):
+                    app.merge_supplier(source, target)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_names_trimmed_internal_whitespace_kept_and_case_sensitive(self):
+        self.app.create_purchase("W1", "North", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("W2", "north", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("W3", "北 辰", [{"code": "BOX", "quantity": 1}])
+        before = self.app.path.read_bytes()
+        # Unknown mixed-case name: lookup is case sensitive.
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("NORTH", "North")
+        # Internal whitespace is part of the name: the double-space name does not exist.
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("北  辰", "北辰包装")
+        # After trimming surrounding whitespace these normalize to the same name.
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier(" 北 辰 ", "北 辰")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The no-space name 北辰 is a different supplier and keeps P2.
+        self.assertEqual(
+            [order["reference"] for order in self.app.supplier_record("北辰")["purchases"]],
+            ["P2"],
+        )
+
+        # Surrounding whitespace is trimmed and the single internal space preserved.
+        self.app.merge_supplier(" 北 辰 ", "  North ")
+        self.assertEqual(
+            [order["reference"] for order in self.app.supplier_record("North")["purchases"]],
+            ["W1", "W3"],
+        )
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("北 辰")
+        # Distinct casings are different names and may merge into each other.
+        self.app.merge_supplier("north", "North")
+        self.assertEqual(
+            [order["reference"] for order in self.app.supplier_record("North")["purchases"]],
+            ["W1", "W2", "W3"],
+        )
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("north")
+        # The unrelated supplier and the no-space 北辰 keep their own orders.
+        self.assertEqual(self.app.purchase_order("P4")["supplier"], "北辰包装")
+        self.assertEqual(
+            [order["reference"] for order in self.app.supplier_record("北辰")["purchases"]],
+            ["P2"],
+        )
+
+
+class MergeSupplierCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        seed_beichen_merge(self.app)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def test_cli_success_prints_target_record_json_and_exit_0(self):
+        payload = self.write_payload("merge.json", {"source": " 北辰旧名 ", "target": " 北辰 "})
+        result = self.run_cli("merge-supplier", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        value = json.loads(result.stdout)
+        self.assertEqual(value, StockRoom(self.root).supplier_record("北辰"))
+        self.assertEqual(
+            {key: value[key] for key in ("supplier", "contact", "phone", "note")},
+            {"supplier": "北辰", "contact": "李", "phone": "123", "note": "保留"},
+        )
+        self.assertEqual([order["reference"] for order in value["purchases"]], ["P1", "P2", "P3"])
+
+    def test_cli_failure_prints_error_json_to_stderr_and_exit_2(self):
+        before = self.app.path.read_bytes()
+        payload = self.write_payload("bad.json", {"source": "幽灵", "target": "北辰"})
+        result = self.run_cli("merge-supplier", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.purchase_order("P1")["supplier"], "北辰旧名")
+        # No data file is created when the directory starts empty.
+        empty = self.root / "cli-empty"
+        empty_payload = self.root / "empty-input.json"
+        empty_payload.write_text(json.dumps({"source": "A", "target": "B"}), encoding="utf-8")
+        empty_result = subprocess.run(
+            [sys.executable, "-m", "stock_room", "--root", str(empty), "merge-supplier", str(empty_payload)],
+            text=True, capture_output=True)
+        self.assertEqual(empty_result.returncode, 2)
+        self.assertIn("error", json.loads(empty_result.stderr))
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_cli_array_first_success_persists_when_second_fails(self):
+        payload = self.write_payload("merges.json", [
+            {"source": "北辰旧名", "target": "北辰"},
+            {"source": "北辰旧名", "target": "北辰包装"},
+        ])
+        result = self.run_cli("merge-supplier", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        # The first merge survived; the failed second item changed nothing else.
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["supplier"] for item in reopened.suppliers()], ["北辰", "北辰包装"])
+        record = reopened.supplier_record("北辰")
+        self.assertEqual(
+            {key: record[key] for key in ("contact", "phone", "note")},
+            {"contact": "李", "phone": "123", "note": "保留"},
+        )
+        self.assertEqual([order["reference"] for order in record["purchases"]], ["P1", "P2", "P3"])
+        packaging = reopened.supplier_record("北辰包装")
+        self.assertEqual(
+            {key: packaging[key] for key in ("contact", "phone", "note")},
+            {"contact": "", "phone": "", "note": ""},
+        )
+        self.assertEqual([order["reference"] for order in packaging["purchases"]], ["P4"])
+        self.assertEqual(reopened.purchase_order("P4")["supplier"], "北辰包装")
+        with self.assertRaises(ValueError):
+            reopened.supplier_record("北辰旧名")
