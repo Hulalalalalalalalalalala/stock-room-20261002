@@ -3758,6 +3758,208 @@ class PurchaseOrdersTests(unittest.TestCase):
         self.assertFalse((empty / "data.json").exists())
 
 
+class ExportPurchasesCsvTests(unittest.TestCase):
+    HEADER = "reference,supplier,status,progress,code,name,unit,quantity,received,returned,net_received,remaining"
+    HEADER_ONLY = HEADER + "\n"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "包")
+        self.app.register("BOX", "纸箱", "个")
+        # PO-B created before PO-A to verify codepoint ordering.
+        self.app.create_purchase("PO-B", "北方", [{"code": "PAPER", "quantity": 10}, {"code": "BOX", "quantity": 3}])
+        self.app.receive_purchase("PO-B", [{"code": "PAPER", "quantity": 6, "reference": "RCV-B-1"}])
+        self.app.return_purchase("RCV-B-1", 2, "RET-B-1")
+        self.app.create_purchase("PO-A", "南方", [{"code": "PAPER", "quantity": 5}])
+
+    def parse(self, content):
+        return list(csv.reader(io.StringIO(content), strict=True))
+
+    def references(self, content):
+        return [row[0] for row in self.parse(content)[1:]]
+
+    def test_default_export_header_and_rows(self):
+        content = self.app.export_purchases_csv()
+        rows = self.parse(content)
+        self.assertEqual(rows[0], ["reference", "supplier", "status", "progress", "code", "name", "unit",
+                                   "quantity", "received", "returned", "net_received", "remaining"])
+        self.assertTrue(all(len(row) == 12 for row in rows))
+        self.assertEqual([row[0] for row in rows[1:]], ["PO-A", "PO-B", "PO-B"])
+        self.assertEqual(rows[1], ["PO-A", "南方", "open", "pending", "PAPER", "包装纸", "包", "5", "0", "0", "0", "5"])
+        self.assertEqual(rows[2], ["PO-B", "北方", "open", "partial", "PAPER", "包装纸", "包", "10", "6", "2", "4", "4"])
+        self.assertEqual(rows[3], ["PO-B", "北方", "open", "partial", "BOX", "纸箱", "个", "3", "0", "0", "0", "3"])
+
+    def test_paper_scenario_figures_are_10_6_2_4_4_and_partial(self):
+        rows = self.parse(self.app.export_purchases_csv(supplier="北"))
+        self.assertEqual(len(rows), 3)
+        paper = rows[1]
+        self.assertEqual(paper[3], "partial")
+        self.assertEqual(paper[7:12], ["10", "6", "2", "4", "4"])
+
+    def test_row_order_and_repeated_prefix_columns(self):
+        content = self.app.export_purchases_csv(status="open")
+        records = self.parse(content)[1:]
+        self.assertEqual([(r[0], r[4]) for r in records],
+                         [("PO-A", "PAPER"), ("PO-B", "PAPER"), ("PO-B", "BOX")])
+        for record in records:
+            if record[0] == "PO-B":
+                self.assertEqual(record[:4], ["PO-B", "北方", "open", record[3]])
+
+    def test_rename_movements_and_counts_keep_snapshot_and_stats(self):
+        self.app.update_material("PAPER", "加厚包装纸", "包")
+        self.app.movement("PAPER", 100, "IN-9")
+        self.app.movement("PAPER", -40, "OUT-9")
+        self.app.count("BOX", 8, "CNT-9")
+        content = self.app.export_purchases_csv()
+        self.assertIn("PO-B,北方,open,partial,PAPER,包装纸,包,10,6,2,4,4\n", content)
+        self.assertNotIn("加厚包装纸", content)
+        self.assertEqual(StockRoom(self.root).export_purchases_csv(), content)
+
+    def test_complete_stays_complete_after_full_return_and_cancelled_is_independent(self):
+        app = StockRoom(self.root / "other")
+        app.register("X", "物料", "个")
+        app.create_purchase("C1", "S", [{"code": "X", "quantity": 4}])
+        app.receive_purchase("C1", [{"code": "X", "quantity": 4, "reference": "R1"}])
+        app.return_purchase("R1", 4, "T1")
+        self.assertEqual(app.export_purchases_csv(progress="complete"),
+                         self.HEADER_ONLY + "C1,S,open,complete,X,物料,个,4,4,4,0,0\n")
+        app.cancel_purchase("C1")
+        self.assertEqual(app.export_purchases_csv(status="cancelled"),
+                         self.HEADER_ONLY + "C1,S,cancelled,complete,X,物料,个,4,4,4,0,0\n")
+        self.assertEqual(app.export_purchases_csv(progress="complete", status="cancelled"),
+                         self.HEADER_ONLY + "C1,S,cancelled,complete,X,物料,个,4,4,4,0,0\n")
+        self.assertEqual(app.export_purchases_csv(progress="pending"), self.HEADER_ONLY)
+
+    def test_filters_match_purchase_orders_semantics(self):
+        export = self.app.export_purchases_csv
+        self.assertEqual(self.references(export(supplier="北")), ["PO-B", "PO-B"])
+        self.assertEqual(self.references(export(supplier=" 南 ")), ["PO-A"])
+        self.assertEqual(self.references(export(supplier="po")), [])
+        self.assertEqual(self.references(export(status="open")), ["PO-A", "PO-B", "PO-B"])
+        self.assertEqual(self.references(export(progress="partial")), ["PO-B", "PO-B"])
+        self.assertEqual(export(supplier="北", status="cancelled"), self.HEADER_ONLY)
+        self.assertEqual(export(progress="complete"), self.HEADER_ONLY)
+
+    def test_no_bom_lf_only_trailing_newline_and_integers_plain(self):
+        content = self.app.export_purchases_csv()
+        encoded = content.encode("utf-8")
+        self.assertFalse(encoded.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\r", encoded)
+        self.assertTrue(content.startswith(self.HEADER + "\n"))
+        self.assertTrue(content.endswith("\n"))
+        self.assertFalse(content.endswith("\n\n"))
+        for row in self.parse(content)[1:]:
+            for index in (7, 8, 9, 10, 11):
+                self.assertRegex(row[index], r"^-?\d+$")
+
+    def test_special_characters_are_quoted_and_round_trip(self):
+        special = '供,应"商\n次\r行 内\t部'
+        self.app.create_purchase("PO-C", special, [{"code": "PAPER", "quantity": 1}])
+        content = self.app.export_purchases_csv(supplier="应")
+        quoted = '"' + special.replace('"', '""') + '"'
+        self.assertIn("PO-C," + quoted + ",open,pending,", content)
+        record = next(row for row in self.parse(content) if row[0] == "PO-C")
+        self.assertEqual(record[1], special)
+        self.assertNotIn(b"\xef\xbb\xbf", content.encode("utf-8"))
+
+    def test_empty_directory_and_no_match_header_only_without_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.export_purchases_csv(), self.HEADER_ONLY)
+        self.assertEqual(app.export_purchases_csv(supplier="x"), self.HEADER_ONLY)
+        self.assertFalse((empty / "data.json").exists())
+        self.assertEqual(self.app.export_purchases_csv(supplier="不存在"), self.HEADER_ONLY)
+
+    def test_invalid_arguments_rejected_even_without_data(self):
+        empty = self.root / "invalid"
+        app = StockRoom(empty)
+        for kwargs in (
+            {"supplier": None}, {"supplier": 123}, {"supplier": ["北"]},
+            {"status": "OPEN"}, {"status": "closed"}, {"status": True}, {"status": 0},
+            {"progress": "done"}, {"progress": "Pending"}, {"progress": True}, {"progress": 1},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    app.export_purchases_csv(**kwargs)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_export_is_deterministic_and_read_only(self):
+        before = self.app.path.read_bytes()
+        first = self.app.export_purchases_csv()
+        filters = ({}, {"supplier": "北"}, {"status": "open", "progress": "partial"}, {"progress": "pending"})
+        for kwargs in filters:
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(self.app.export_purchases_csv(**kwargs),
+                                 StockRoom(self.root).export_purchases_csv(**kwargs))
+        self.assertEqual(self.app.export_purchases_csv(), first)
+        for kwargs in ({"status": "bad"}, {"progress": "bad"}, {"supplier": None}):
+            with self.assertRaises(ValueError):
+                self.app.export_purchases_csv(**kwargs)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 4)
+        self.assertEqual(len(self.app.purchase_receipts("PO-B")), 1)
+        self.assertEqual(len(self.app.purchase_returns("PO-B")), 1)
+
+    def test_legacy_data_missing_links_counts_as_zero_and_purchases_as_empty(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        path = legacy / "data.json"
+        document = {
+            "materials": {"OLD": {"code": "OLD", "name": "旧料", "unit": "个"}},
+            "purchases": [{"reference": "L1", "supplier": "S", "status": "open",
+                           "rows": [{"code": "OLD", "name": "旧料", "unit": "个", "quantity": 9}]}],
+        }
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        before = path.read_bytes()
+        expected = self.HEADER_ONLY + "L1,S,open,pending,OLD,旧料,个,9,0,0,0,9\n"
+        self.assertEqual(StockRoom(legacy).export_purchases_csv(), expected)
+        self.assertEqual(path.read_bytes(), before)
+        blank = self.root / "blank"
+        blank.mkdir()
+        (blank / "data.json").write_text(json.dumps({"materials": {}}, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(StockRoom(blank).export_purchases_csv(), self.HEADER_ONLY)
+
+    def run_cli(self, root, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(root), *args],
+                              text=True, capture_output=True)
+
+    def test_cli_omitted_file_object_array_and_failure(self):
+        result = self.run_cli(self.root, "export-purchases-csv")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), self.app.export_purchases_csv())
+        payload = self.root / "filter.json"
+        payload.write_text(json.dumps({"supplier": "北", "status": "open", "progress": "partial"}), encoding="utf-8")
+        result = self.run_cli(self.root, "export-purchases-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         self.app.export_purchases_csv(supplier="北", status="open", progress="partial"))
+        array_payload = self.root / "array.json"
+        array_payload.write_text(json.dumps([{}, {"supplier": "不存在"}]), encoding="utf-8")
+        result = self.run_cli(self.root, "export-purchases-csv", str(array_payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual(values, [self.app.export_purchases_csv(), self.HEADER_ONLY])
+        self.assertTrue(all(isinstance(value, str) for value in values))
+        bad = self.root / "bad.json"
+        before = self.app.path.read_bytes()
+        bad.write_text(json.dumps({"status": "closed"}), encoding="utf-8")
+        failed = self.run_cli(self.root, "export-purchases-csv", str(bad))
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_empty_directory_header_only_without_creating_file(self):
+        empty = self.root / "cli-empty"
+        result = self.run_cli(empty, "export-purchases-csv")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), self.HEADER_ONLY)
+        self.assertFalse((empty / "data.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
 
