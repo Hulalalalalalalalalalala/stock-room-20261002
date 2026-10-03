@@ -433,6 +433,82 @@ class StockRoom(JsonStore):
         self._write(data)
         return dict(record)
 
+    def reverse_batch(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        planned = self._plan_reversals(data, rows)
+        movements = data.setdefault("movements", [])
+        records = []
+        for row in planned:
+            movements.append({"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]})
+            records.append({key: row[key] for key in ("code", "original_reference", "reference", "quantity", "balance")})
+        data.setdefault("reversals", []).extend(records)
+        self._write(data)
+        return [dict(record) for record in records]
+
+    def _plan_reversals(self, data, rows):
+        # Shared batch reversal rules: each row is validated in input order
+        # against the pre-batch ledger (new reversals never act as originals
+        # within the same batch), the reference namespace and the running
+        # per-material balance. Nothing is written here; the caller commits
+        # the whole plan atomically.
+        counts = data.get("counts", [])
+        reversals = data.get("reversals", [])
+        movements = data.get("movements", [])
+        count_references = {row["reference"] for row in counts}
+        reversal_references = {row["reference"] for row in reversals}
+        reversed_originals = {row["original_reference"] for row in reversals}
+        receipt_references = {row["reference"] for receipts in data.get("purchase_receipts", {}).values() for row in receipts}
+        return_references = {row["reference"] for records in data.get("purchase_returns", {}).values() for row in records}
+        movement_index = {row["reference"]: row for row in movements}
+        balances = {}
+        seen_originals = set()
+        seen_references = set()
+        planned = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"original_reference", "reference"}:
+                raise ValueError("each row must be an object with original_reference and reference")
+            original_reference = text(entry["original_reference"], "original_reference")
+            reference = text(entry["reference"], "reference")
+            if original_reference in count_references:
+                raise ValueError("cannot reverse a count")
+            if original_reference in reversal_references:
+                raise ValueError("cannot reverse a reversal")
+            if original_reference in reversed_originals:
+                raise ValueError("movement already reversed")
+            if original_reference in receipt_references:
+                raise ValueError("cannot reverse a purchase receipt")
+            if original_reference in return_references:
+                raise ValueError("cannot reverse a purchase return")
+            original = movement_index.get(original_reference)
+            if original is None:
+                raise ValueError("unknown original reference")
+            if original_reference in seen_originals:
+                raise ValueError("movement already reversed")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            if reference in reversal_references:
+                raise ValueError("reference already exists")
+            code = original["code"]
+            quantity = -original["quantity"]
+            if code not in balances:
+                balances[code] = sum(row["quantity"] for row in movements if row["code"] == code)
+            balances[code] += quantity
+            if balances[code] < 0:
+                raise ValueError("insufficient stock")
+            seen_originals.add(original_reference)
+            seen_references.add(reference)
+            planned.append({
+                "code": code,
+                "original_reference": original_reference,
+                "reference": reference,
+                "quantity": quantity,
+                "balance": balances[code],
+            })
+        return planned
+
     def reversals(self, code):
         code = text(code, "code")
         data = self._read()

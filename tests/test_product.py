@@ -310,6 +310,180 @@ class ReversalTests(unittest.TestCase):
         self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
 
 
+class ReverseBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.movement("BOX", 3, "BIN")
+
+    def test_batch_reverses_in_order_with_running_balances(self):
+        records = self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ])
+        self.assertEqual(records, [
+            {"code": "PAPER", "original_reference": "OUT-001", "reference": "REV-OUT", "quantity": 6, "balance": 20},
+            {"code": "PAPER", "original_reference": "IN-001", "reference": "REV-IN", "quantity": -20, "balance": 0},
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 0)
+        self.assertEqual([row["quantity"] for row in self.app.history("PAPER")], [20, -6, 6, -20])
+        ledger = self.app.movement_ledger("PAPER", kind="reversal")
+        self.assertEqual([(row["reference"], row["related_reference"]) for row in ledger], [("REV-OUT", "OUT-001"), ("REV-IN", "IN-001")])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in reopened.reversals("PAPER")], ["REV-OUT", "REV-IN"])
+
+    def test_batch_spans_materials_and_rejected_row_aborts_everything(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "BIN", "reference": "REV-BIN"},
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.reversals("BOX"), [])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        records = self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+            {"original_reference": "BIN", "reference": "REV-BIN"},
+        ])
+        self.assertEqual([row["balance"] for row in records], [20, 0, 0])
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+
+    def test_swapped_order_fails_and_leaves_stock_at_14(self):
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(len(self.app.reversals("PAPER")), 0)
+        # Failed request's references are reusable.
+        record = self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-IN"}])
+        self.assertEqual(record[0]["reference"], "REV-IN")
+
+    def test_batch_validates_rows_and_identifiers(self):
+        for rows in (None, [], "rows", 1, [None], ["x"], [{}]):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch(rows)
+        for value in ("", "   ", 7, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch([{"original_reference": value, "reference": "R"}])
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch([{"original_reference": "OUT-001", "reference": value}])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "OUT-001"}])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "R", "extra": 1}])
+        record = self.app.reverse_batch([{"original_reference": "  OUT-001  ", "reference": "  REV OUT  "}])
+        self.assertEqual((record[0]["original_reference"], record[0]["reference"]), ("OUT-001", "REV OUT"))
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "out-001", "reference": "LOWER"}])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "IN-001", "reference": "REV OUT"}])
+
+    def test_batch_rejects_invalid_originals_and_duplicates(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        self.app.count("PAPER", 10, "CNT-001")
+        cases = [
+            [{"original_reference": "MISSING", "reference": "R1"}],
+            [{"original_reference": "CNT-ZERO", "reference": "R1"}],
+            [{"original_reference": "CNT-001", "reference": "R1"}],
+            [
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+                {"original_reference": "REV-OUT", "reference": "R2"},
+            ],
+            [
+                {"original_reference": "OUT-001", "reference": "A"},
+                {"original_reference": "OUT-001", "reference": "B"},
+            ],
+            [{"original_reference": "IN-001", "reference": "IN-001"}],
+            [{"original_reference": "IN-001", "reference": "CNT-ZERO"}],
+            [
+                {"original_reference": "IN-001", "reference": "DUP"},
+                {"original_reference": "BIN", "reference": "DUP"},
+            ],
+        ]
+        for rows in cases:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch(rows)
+        self.app.reverse("OUT-001", "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "R3"}])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "REV-OUT", "reference": "R4"}])
+        self.assertEqual([row["reference"] for row in self.app.reversals("PAPER")], ["REV-OUT"])
+
+    def test_batch_rejects_purchase_receipt_and_return_originals(self):
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.create_purchase("PO-1", "supplier", [{"code": "TAPE", "quantity": 5}])
+        self.app.receive_purchase("PO-1", [{"code": "TAPE", "quantity": 5, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 2, "RET-1")
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "RCV-1", "reference": "RR"}])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "RET-1", "reference": "RR2"}])
+        # Purchase references keep their own namespace.
+        self.app.create_purchase("RCV-1", "supplier", [{"code": "TAPE", "quantity": 1}])
+
+    def test_batch_allows_inactive_material(self):
+        self.app.set_active("PAPER", False)
+        record = self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-OUT"}])
+        self.assertEqual(record[0]["balance"], 20)
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+
+    def test_batch_failure_creates_no_file_and_reuses_references(self):
+        empty_root = Path(self.temp.name) / "empty"
+        app = StockRoom(empty_root)
+        with self.assertRaises(ValueError):
+            app.reverse_batch([{"original_reference": "X", "reference": "Y"}])
+        self.assertFalse((empty_root / "data.json").exists())
+
+    def test_batch_reversed_originals_cannot_be_reversed_singly_afterwards(self):
+        self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ])
+        with self.assertRaises(ValueError):
+            self.app.reverse("OUT-001", "REV-OUT-2")
+        with self.assertRaises(ValueError):
+            self.app.reverse("IN-001", "REV-IN-2")
+
+    def test_cli_reverse_batch_success_failure_and_independent_batches(self):
+        payload = self.root / "reverse-batch.json"
+        payload.write_text(json.dumps({"rows": [
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["balance"] for row in json.loads(result.stdout)], [20, 0])
+        payload.write_text(json.dumps({"rows": [{"original_reference": "OUT-001", "reference": "AGAIN"}]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        payload.write_text(json.dumps([
+            {"rows": [{"original_reference": "BIN", "reference": "REV-BIN"}]},
+            {"rows": [{"original_reference": "OUT-001", "reference": "REV-AGAIN"}]},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in self.app.reversals("PAPER")], ["REV-OUT", "REV-IN"])
+
+
 class MinimumStockTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
