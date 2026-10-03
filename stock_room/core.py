@@ -629,6 +629,23 @@ class StockRoom(JsonStore):
             raise ValueError("unknown purchase reference")
         return self._purchase_snapshot(order)
 
+    def purchase_changes(self, reference):
+        reference = text(reference, "reference")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        return [
+            {
+                "reference": row["reference"],
+                "sequence": row["sequence"],
+                "action": row["action"],
+                "before": self._purchase_snapshot(row["before"]),
+                "after": self._purchase_snapshot(row["after"]),
+            }
+            for row in data.get("purchase_changes", {}).get(reference, [])
+        ]
+
     def cancel_purchase(self, reference):
         reference = text(reference, "reference")
         data = self._read()
@@ -636,7 +653,9 @@ class StockRoom(JsonStore):
         if order is None:
             raise ValueError("unknown purchase reference")
         if order["status"] != "cancelled":
+            before = self._purchase_snapshot(order)
             order["status"] = "cancelled"
+            self._record_purchase_change(data, order, "cancel_purchase", before)
             self._write(data)
         return self._purchase_snapshot(order)
 
@@ -673,8 +692,10 @@ class StockRoom(JsonStore):
             seen.add(code)
             material = materials[code]
             parsed.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": quantity})
+        before = self._purchase_snapshot(order)
         order["supplier"] = supplier
         order["rows"] = parsed
+        self._record_purchase_change(data, order, "update_purchase", before)
         self._write(data)
         return self._purchase_snapshot(order)
 
@@ -1184,7 +1205,9 @@ class StockRoom(JsonStore):
         target_profile = profiles.get(target)
         for order in orders:
             if order["supplier"] == source:
+                before = self._purchase_snapshot(order)
                 order["supplier"] = target
+                self._record_purchase_change(data, order, "merge_supplier", before)
         if source_profile is not None or target_profile is not None:
             merged = {"supplier": target}
             for field in ("contact", "phone", "note"):
@@ -1249,6 +1272,23 @@ class StockRoom(JsonStore):
             "status": order["status"],
             "rows": [dict(row) for row in order["rows"]],
         }
+
+    def _record_purchase_change(self, data, order, action, before):
+        # Append a change only when the normalized effective order actually
+        # differs; repeat submissions succeed without growing the history.
+        # The sequence is per purchase and starts at 1. Snapshots are fresh
+        # dicts so later business can never rewrite a saved one.
+        after = self._purchase_snapshot(order)
+        if before == after:
+            return
+        records = data.setdefault("purchase_changes", {}).setdefault(order["reference"], [])
+        records.append({
+            "reference": order["reference"],
+            "sequence": len(records) + 1,
+            "action": action,
+            "before": before,
+            "after": after,
+        })
 
     def set_active(self, code, active):
         code = text(code, "code")
