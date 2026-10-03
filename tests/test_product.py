@@ -310,6 +310,275 @@ class ReversalTests(unittest.TestCase):
         self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
 
 
+class ReverseBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+
+    def test_fixed_sample_reverse_issue_then_receipt_balances_20_0(self):
+        results = self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ])
+        self.assertEqual(results, [
+            {"code": "PAPER", "original_reference": "OUT-001", "reference": "REV-OUT", "quantity": 6, "balance": 20},
+            {"code": "PAPER", "original_reference": "IN-001", "reference": "REV-IN", "quantity": -20, "balance": 0},
+        ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001", "OUT-001", "REV-OUT", "REV-IN"])
+        self.assertEqual([row["reference"] for row in self.app.reversals("PAPER")], ["REV-OUT", "REV-IN"])
+        ledger = self.app.movement_ledger("PAPER")
+        self.assertEqual([(row["kind"], row["related_reference"]) for row in ledger[-2:]], [("reversal", "OUT-001"), ("reversal", "IN-001")])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 0)
+        self.assertEqual([row["quantity"] for row in reopened.history("PAPER")], [20, -6, 6, -20])
+        self.assertEqual([row["balance"] for row in reopened.reversals("PAPER")], [20, 0])
+
+    def test_swapped_order_fails_entire_batch_and_keeps_stock_14(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(len(self.app.history("PAPER")), 2)
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_failed_request_references_can_be_reused_after_fix(self):
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            ])
+        results = self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ])
+        self.assertEqual([row["balance"] for row in results], [20, 0])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 0)
+
+    def test_cross_material_and_repeated_material_carry_balances(self):
+        self.app.movement("BOX", 5, "BOX-IN")
+        self.app.movement("PAPER", -4, "OUT-002")
+        results = self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT-1"},
+            {"original_reference": "BOX-IN", "reference": "REV-BOX"},
+            {"original_reference": "OUT-002", "reference": "REV-OUT-2"},
+        ])
+        self.assertEqual([(row["code"], row["balance"]) for row in results], [("PAPER", 16), ("BOX", 0), ("PAPER", 20)])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+
+    def test_later_replenishing_row_does_not_save_negative_row(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 14)
+        self.assertEqual(len(reopened.history("PAPER")), 2)
+        self.assertEqual(reopened.reversals("PAPER"), [])
+
+    def test_invalid_rows_shape_rejected(self):
+        for rows in (None, [], {}, "x", 1):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch(rows)
+
+    def test_invalid_row_shape_rejected(self):
+        good = {"original_reference": "OUT-001", "reference": "REV-OUT"}
+        for rows in (
+            [None],
+            ["OUT-001"],
+            [[]],
+            [{"original_reference": "OUT-001"}],
+            [{"reference": "REV-OUT"}],
+            [{"original_reference": "OUT-001", "reference": "REV-OUT", "extra": 1}],
+            [good, good],
+        ):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch(rows)
+
+    def test_invalid_identifiers_rejected(self):
+        for value in ("", "   ", 11, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch([{"original_reference": value, "reference": "REV-X"}])
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch([{"original_reference": "OUT-001", "reference": value}])
+
+    def test_identifiers_are_stripped_internal_whitespace_kept_and_case_sensitive(self):
+        results = self.app.reverse_batch([
+            {"original_reference": "  OUT-001  ", "reference": "  REV OUT  "},
+        ])
+        self.assertEqual(results[0]["original_reference"], "OUT-001")
+        self.assertEqual(results[0]["reference"], "REV OUT")
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "in-001", "reference": "REV-LOWER"}])
+
+    def test_duplicate_original_within_batch_rejected(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "OUT-001", "reference": "REV-1"},
+                {"original_reference": "  OUT-001  ", "reference": "REV-2"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_original_already_reversed_by_single_entry_rejected(self):
+        self.app.reverse("OUT-001", "REV-OUT")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-AGAIN"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(len(self.app.reversals("PAPER")), 1)
+
+    def test_count_reversal_receipt_and_return_originals_rejected(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        self.app.count("BOX", 3, "CNT-BOX")
+        self.app.reverse("OUT-001", "REV-OUT")
+        self.app.create_purchase("PO-1", "供应商", [{"code": "BOX", "quantity": 5}])
+        self.app.receive_purchase("PO-1", [{"code": "BOX", "quantity": 5, "reference": "RC-1"}])
+        self.app.return_purchase("RC-1", 2, "RT-1")
+        before = self.app.path.read_bytes()
+        for original in ("CNT-ZERO", "CNT-BOX", "REV-OUT", "RC-1", "RT-1", "MISSING"):
+            with self.subTest(original=original):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch([{"original_reference": original, "reference": "REV-" + original}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 6)
+
+    def test_batch_created_reversal_cannot_serve_as_later_original(self):
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+                {"original_reference": "REV-OUT", "reference": "REV-REV"},
+            ])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_new_reference_conflicts_within_batch_and_with_existing(self):
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "OUT-001", "reference": "DUP"},
+                {"original_reference": "IN-001", "reference": "  DUP  "},
+            ])
+        self.app.count("BOX", 1, "CNT-EXIST")
+        for reference in ("IN-001", "OUT-001", "CNT-EXIST"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.reverse_batch([{"original_reference": "OUT-001", "reference": reference}])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_purchase_reference_namespace_stays_independent(self):
+        self.app.create_purchase("REV-OUT", "供应商", [{"code": "BOX", "quantity": 1}])
+        results = self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-OUT"}])
+        self.assertEqual(results[0]["reference"], "REV-OUT")
+        self.assertEqual(self.app.purchase_order("REV-OUT")["status"], "open")
+
+    def test_inactive_material_can_still_be_reversed_in_batch(self):
+        self.app.set_active("PAPER", False)
+        results = self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-OUT"}])
+        self.assertEqual((results[0]["quantity"], results[0]["balance"]), (6, 20))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+
+    def test_failed_batch_preserves_counts_minimum_status_and_purchases(self):
+        self.app.count("PAPER", 11, "CNT-001")
+        self.app.set_minimum("BOX", 2)
+        self.app.create_purchase("PO-1", "供应商", [{"code": "BOX", "quantity": 4}])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "MISSING", "reference": "REV-X"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
+        self.assertEqual([row["counted"] for row in self.app.counts("PAPER")], [11])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual([item["code"] for item in self.app.shortages()], ["BOX"])
+        self.assertEqual(self.app.purchase_order("PO-1")["status"], "open")
+
+    def test_failed_batch_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.reverse_batch([])
+        with self.assertRaises(ValueError):
+            app.reverse_batch([{"original_reference": "MISSING", "reference": "REV-X"}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_batch_reversed_originals_cannot_be_reversed_again_singly(self):
+        self.app.reverse_batch([
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ])
+        with self.assertRaises(ValueError):
+            self.app.reverse("OUT-001", "REV-OUT-2")
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).reverse("IN-001", "REV-IN-2")
+
+    def test_failed_batch_after_successful_batch_preserves_first_batch(self):
+        self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-OUT"}])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-AGAIN"},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.reverse_batch([{"original_reference": "OUT-001", "reference": "REV-AGAIN"}])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 20)
+        self.assertEqual([row["reference"] for row in reopened.reversals("PAPER")], ["REV-OUT"])
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")], ["IN-001", "OUT-001", "REV-OUT"])
+
+    def test_cli_reverse_batch_success_and_failure(self):
+        payload = self.root / "reverse-batch.json"
+        payload.write_text(json.dumps({"rows": [
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(row["quantity"], row["balance"]) for row in json.loads(result.stdout)], [(6, 20), (-20, 0)])
+        bad = self.root / "bad-reverse-batch.json"
+        bad.write_text(json.dumps({"rows": [{"original_reference": "MISSING", "reference": "REV-X"}]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse-batch", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 0)
+
+    def test_cli_reverse_batch_array_commits_each_batch_independently(self):
+        payload = self.root / "reverse-batches.json"
+        payload.write_text(json.dumps([
+            {"rows": [{"original_reference": "OUT-001", "reference": "REV-OUT"}]},
+            {"rows": [{"original_reference": "OUT-001", "reference": "REV-AGAIN"}]},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "reverse-batch", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        self.assertEqual(len(self.app.reversals("PAPER")), 1)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 20)
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")][-1], "REV-OUT")
+
+
 class MinimumStockTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

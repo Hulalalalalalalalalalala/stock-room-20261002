@@ -433,6 +433,74 @@ class StockRoom(JsonStore):
         self._write(data)
         return dict(record)
 
+    def reverse_batch(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        planned = self._plan_reversals(data, rows)
+        movements = data.setdefault("movements", [])
+        reversals = data.setdefault("reversals", [])
+        for record in planned:
+            movements.append({"code": record["code"], "quantity": record["quantity"], "reference": record["reference"]})
+            reversals.append(dict(record))
+        self._write(data)
+        return [dict(record) for record in planned]
+
+    def _plan_reversals(self, data, rows):
+        # Shared batch reversal rules for the atomic commit path: each row is
+        # validated in input order against the original movement, the
+        # reference namespace and the running per-material balance. Reversal
+        # records created by this batch are not yet part of the ledger, so
+        # they can neither serve as later originals nor cover each other's
+        # new references. Nothing is written here; the caller commits the
+        # plan only after every row has passed.
+        counts = data.get("counts", [])
+        existing_reversals = data.get("reversals", [])
+        movements = data.get("movements", [])
+        count_references = {row["reference"] for row in counts}
+        reversal_references = {row["reference"] for row in existing_reversals}
+        reversed_originals = {row["original_reference"] for row in existing_reversals}
+        receipt_references = {row["reference"] for receipts in data.get("purchase_receipts", {}).values() for row in receipts}
+        return_references = {row["reference"] for records in data.get("purchase_returns", {}).values() for row in records}
+        balances = {}
+        seen_originals = set()
+        seen_references = set()
+        planned = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"original_reference", "reference"}:
+                raise ValueError("each row must be an object with original_reference and reference")
+            original_reference = text(entry["original_reference"], "original_reference")
+            reference = text(entry["reference"], "reference")
+            if original_reference in count_references:
+                raise ValueError("cannot reverse a count")
+            if original_reference in reversal_references:
+                raise ValueError("cannot reverse a reversal")
+            if original_reference in reversed_originals or original_reference in seen_originals:
+                raise ValueError("movement already reversed")
+            if original_reference in receipt_references:
+                raise ValueError("cannot reverse a purchase receipt")
+            if original_reference in return_references:
+                raise ValueError("cannot reverse a purchase return")
+            original = next((row for row in movements if row["reference"] == original_reference), None)
+            if original is None:
+                raise ValueError("unknown original reference")
+            code = original["code"]
+            quantity = -original["quantity"]
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            if code not in balances:
+                balances[code] = sum(row["quantity"] for row in movements if row["code"] == code)
+            before = balances[code]
+            balance = before + quantity
+            if balance < 0:
+                raise ValueError("insufficient stock")
+            balances[code] = balance
+            seen_originals.add(original_reference)
+            seen_references.add(reference)
+            planned.append({"code": code, "original_reference": original_reference, "reference": reference, "quantity": quantity, "balance": balance})
+        return planned
+
     def reversals(self, code):
         code = text(code, "code")
         data = self._read()
