@@ -4561,3 +4561,180 @@ class MergeSupplierCliTests(unittest.TestCase):
         self.assertEqual(reopened.purchase_order("P4")["supplier"], "北辰包装")
         with self.assertRaises(ValueError):
             reopened.supplier_record("北辰旧名")
+
+class MaterialChangeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("BOX", "纸箱", "个")
+
+    def profile(self, name="纸箱", unit="个", minimum=0, active=True):
+        return {"name": name, "unit": unit, "minimum": minimum, "active": active}
+
+    def test_fixed_sample_rename_minimum_repeated_deactivate_survives_reopen(self):
+        self.assertEqual(self.app.update_material("  BOX  ", "周转箱", "  个  "), {"code": "BOX", "name": "周转箱", "unit": "个"})
+        self.assertEqual(self.app.set_minimum("BOX", 5), {"code": "BOX", "minimum": 5})
+        self.assertEqual(self.app.set_active("BOX", False), {"code": "BOX", "active": False})
+        self.assertEqual(self.app.set_active("BOX", False), {"code": "BOX", "active": False})
+        changes = StockRoom(self.root).material_changes("BOX")
+        self.assertEqual([row["sequence"] for row in changes], [1, 2, 3])
+        self.assertEqual([row["action"] for row in changes], ["update_material", "set_minimum", "set_active"])
+        expected = [
+            (self.profile(), self.profile(name="周转箱")),
+            (self.profile(name="周转箱"), self.profile(name="周转箱", minimum=5)),
+            (self.profile(name="周转箱", minimum=5), self.profile(name="周转箱", minimum=5, active=False)),
+        ]
+        for row, (before, after) in zip(changes, expected):
+            self.assertEqual(set(row), {"code", "sequence", "action", "before", "after"})
+            self.assertEqual(row["code"], "BOX")
+            self.assertEqual(row["before"], before)
+            self.assertEqual(row["after"], after)
+            self.assertEqual(set(row["before"]), {"name", "unit", "minimum", "active"})
+            self.assertEqual(set(row["after"]), {"name", "unit", "minimum", "active"})
+
+    def test_empty_history_for_registered_material_and_inactive_query(self):
+        self.assertEqual(self.app.material_changes("BOX"), [])
+        self.app.set_active("BOX", False)
+        reopened = StockRoom(self.root)
+        changes = reopened.material_changes("  BOX  ")
+        self.assertEqual([(row["sequence"], row["action"]) for row in changes], [(1, "set_active")])
+        self.assertEqual(changes[0]["after"]["active"], False)
+
+    def test_invalid_code_arguments_rejected(self):
+        for code in ("", "   ", 11, None, True, ["BOX"]):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.material_changes(code)
+        with self.assertRaises(ValueError):
+            self.app.material_changes("box")
+        with self.assertRaises(ValueError):
+            self.app.material_changes("UNKNOWN")
+
+    def test_case_sensitive_code_with_inner_whitespace(self):
+        self.app.register("A B", "物料", "个")
+        self.app.set_minimum("A B", 2)
+        self.assertEqual(self.app.material_changes("A B")[0]["code"], "A B")
+        with self.assertRaises(ValueError):
+            self.app.material_changes("AB")
+        with self.assertRaises(ValueError):
+            self.app.material_changes("a b")
+
+    def test_repeat_values_add_no_records_and_combined_profile_one_record(self):
+        self.app.update_material("BOX", "纸箱", "个")
+        self.app.set_minimum("BOX", 0)
+        self.app.set_active("BOX", True)
+        self.assertEqual(self.app.material_changes("BOX"), [])
+        self.app.update_material("BOX", "新 纸箱", "只")
+        changes = self.app.material_changes("BOX")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["before"], self.profile())
+        self.assertEqual(changes[0]["after"], self.profile(name="新 纸箱", unit="只"))
+
+    def test_register_and_import_create_no_records_legacy_defaults_in_snapshot(self):
+        self.app.import_materials_csv("code,name,unit\nTAPE,胶带,卷\n")
+        self.assertEqual(self.app.material_changes("BOX"), [])
+        self.assertEqual(self.app.material_changes("TAPE"), [])
+        self.app.set_minimum("TAPE", 1)
+        change = StockRoom(self.root).material_changes("TAPE")[0]
+        self.assertEqual(change["sequence"], 1)
+        self.assertEqual(change["before"], {"name": "胶带", "unit": "卷", "minimum": 0, "active": True})
+        self.assertEqual(change["after"], {"name": "胶带", "unit": "卷", "minimum": 1, "active": True})
+
+    def test_failed_modifications_append_nothing_and_keep_bytes(self):
+        self.app.set_minimum("BOX", 5)
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.movement("TAPE", 1, "TAPE-IN")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.update_material("TAPE", "新胶带", "包")
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "", "个")
+        with self.assertRaises(ValueError):
+            self.app.update_material("UNKNOWN", "纸", "个")
+        with self.assertRaises(ValueError):
+            self.app.set_minimum("BOX", True)
+        with self.assertRaises(ValueError):
+            self.app.set_minimum("UNKNOWN", 1)
+        with self.assertRaises(ValueError):
+            self.app.set_active("BOX", 1)
+        with self.assertRaises(ValueError):
+            self.app.set_active("UNKNOWN", False)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(len(self.app.material_changes("BOX")), 1)
+        self.assertEqual(self.app.material_changes("TAPE"), [])
+
+    def test_query_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.material_changes("BOX")
+        with self.assertRaises(ValueError):
+            app.material_changes(11)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_query_success_and_failure_do_not_modify_file(self):
+        self.app.set_minimum("BOX", 5)
+        before = self.app.path.read_bytes()
+        self.app.material_changes("BOX")
+        with self.assertRaises(ValueError):
+            self.app.material_changes("UNKNOWN")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_returned_snapshots_are_independent_copies(self):
+        self.app.set_minimum("BOX", 5)
+        changes = self.app.material_changes("BOX")
+        changes[0]["after"]["minimum"] = 99
+        changes[0]["action"] = "tampered"
+        fresh = self.app.material_changes("BOX")
+        self.assertEqual(fresh[0]["after"]["minimum"], 5)
+        self.assertEqual(fresh[0]["action"], "set_minimum")
+
+    def test_changes_keep_out_of_other_histories_and_do_not_lock_unit(self):
+        self.app.update_material("BOX", "周转箱", "个")
+        self.app.set_minimum("BOX", 5)
+        self.app.set_active("BOX", False)
+        self.app.set_active("BOX", True)
+        self.assertEqual(self.app.history("BOX"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        self.assertEqual(self.app.reversals("BOX"), [])
+        self.assertEqual(self.app.update_material("BOX", "周转箱", "只")["unit"], "只")
+        changes = self.app.material_changes("BOX")
+        self.assertEqual([row["sequence"] for row in changes], [1, 2, 3, 4, 5])
+        self.assertEqual([row["action"] for row in changes], ["update_material", "set_minimum", "set_active", "set_active", "update_material"])
+
+    def test_sequences_are_independent_between_materials(self):
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.set_minimum("BOX", 1)
+        self.app.set_minimum("TAPE", 2)
+        self.app.set_active("BOX", False)
+        self.app.set_minimum("TAPE", 3)
+        self.assertEqual([(row["sequence"], row["action"]) for row in self.app.material_changes("BOX")], [(1, "set_minimum"), (2, "set_active")])
+        self.assertEqual([(row["sequence"], row["action"]) for row in self.app.material_changes("TAPE")], [(1, "set_minimum"), (2, "set_minimum")])
+
+    def test_cli_query_success_failure_and_no_file_side_effects(self):
+        query = self.root / "query.json"
+        query.write_text(json.dumps({"code": "BOX"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "material-changes", str(query)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [])
+        bad = self.root / "bad-query.json"
+        bad.write_text(json.dumps({"code": "UNKNOWN"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "material-changes", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+
+    def test_cli_array_independent_commit_keeps_earlier_change(self):
+        payload = self.root / "active-batch.json"
+        payload.write_text(json.dumps([
+            {"code": "BOX", "active": False},
+            {"code": "BOX", "active": 1},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-active", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+        changes = self.app.material_changes("BOX")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["after"]["active"], False)
+        self.assertEqual(self.app.material_status("BOX")["active"], False)

@@ -196,8 +196,10 @@ class StockRoom(JsonStore):
                 raise ValueError("unit cannot change after stock history exists")
             if any(row["code"] == code for row in data.get("reversals", [])):
                 raise ValueError("unit cannot change after stock history exists")
+        before = self._material_profile(data, code)
         materials[code]["name"] = name
         materials[code]["unit"] = unit
+        self._record_material_change(data, code, "update_material", before)
         self._write(data)
         return {"code": code, "name": name, "unit": unit}
 
@@ -1255,7 +1257,9 @@ class StockRoom(JsonStore):
         data = self._read()
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
+        before = self._material_profile(data, code)
         data.setdefault("status", {})[code] = active
+        self._record_material_change(data, code, "set_active", before)
         self._write(data)
         return {"code": code, "active": active}
 
@@ -1273,9 +1277,56 @@ class StockRoom(JsonStore):
         data = self._read()
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
+        before = self._material_profile(data, code)
         data.setdefault("minimums", {})[code] = minimum
+        self._record_material_change(data, code, "set_minimum", before)
         self._write(data)
         return {"code": code, "minimum": minimum}
+
+    def material_changes(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return [
+            {
+                "code": row["code"],
+                "sequence": row["sequence"],
+                "action": row["action"],
+                "before": dict(row["before"]),
+                "after": dict(row["after"]),
+            }
+            for row in data.get("material_changes", {}).get(code, [])
+        ]
+
+    @staticmethod
+    def _material_profile(data, code):
+        # Complete effective material profile used for change snapshots.
+        # Legacy data without minimum or active defaults to 0 and True.
+        material = data["materials"][code]
+        return {
+            "name": material["name"],
+            "unit": material["unit"],
+            "minimum": data.get("minimums", {}).get(code, 0),
+            "active": data.get("status", {}).get(code, True),
+        }
+
+    def _record_material_change(self, data, code, action, before):
+        # Append a change only when the normalized effective profile actually
+        # differs; repeat submissions succeed without growing the history.
+        # The sequence is per material and starts at 1. Snapshots are fresh
+        # dicts so later business can never rewrite a saved one.
+        after = self._material_profile(data, code)
+        if before == after:
+            return
+        records = data.setdefault("material_changes", {}).setdefault(code, [])
+        records.append({
+            "code": code,
+            "sequence": len(records) + 1,
+            "action": action,
+            "before": dict(before),
+            "after": dict(after),
+        })
 
     def inventory(self, keyword="", active=None):
         if not isinstance(keyword, str):
