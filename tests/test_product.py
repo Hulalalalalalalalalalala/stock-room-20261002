@@ -4169,3 +4169,289 @@ class ReceivePurchaseBatchTests(unittest.TestCase):
         self.assertEqual(self.app.stock("BOX")["quantity"], 1)
         self.assertEqual([row["reference"] for row in self.app.purchase_receipts("P1")], ["RCV-1"])
         self.assertEqual(self.app.purchase_receipts("P2"), [])
+
+
+class MergeSupplierTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+
+    def seed_fixed_sample(self):
+        # 固定样例：BOX（纸箱/个，最低库存 10）；北辰旧名持有 P1（订 7、
+        # 收 3、退 1）与未收货已取消的 P3（订 2）；北辰持有未收货的 P2
+        # （订 5）；北辰包装持有未收货的 P4（订 1）。
+        self.app.register("BOX", "纸箱", "个")
+        self.app.set_minimum("BOX", 10)
+        self.app.create_purchase("P1", "北辰旧名", [{"code": "BOX", "quantity": 7}])
+        self.app.create_purchase("P3", "北辰旧名", [{"code": "BOX", "quantity": 2}])
+        self.app.create_purchase("P2", "北辰", [{"code": "BOX", "quantity": 5}])
+        self.app.create_purchase("P4", "北辰包装", [{"code": "BOX", "quantity": 1}])
+        self.app.cancel_purchase("P3")
+        self.app.receive_purchase("P1", [{"code": "BOX", "quantity": 3, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 1, "RET-1")
+        self.app.save_supplier("北辰旧名", contact="张", phone="123", note="旧档")
+        self.app.save_supplier("北辰", contact="李", phone="", note="保留")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def test_fixed_sample_merge_contacts_orders_and_persistence(self):
+        self.seed_fixed_sample()
+        snapshots_before = {ref: self.app.purchase_order(ref) for ref in ("P1", "P2", "P3", "P4")}
+        receipts_before = self.app.purchase_receipts("P1")
+        returns_before = self.app.purchase_returns("P1")
+        result = self.app.merge_supplier("  北辰旧名  ", "  北辰  ")
+        # 返回值与合并后的精确查询完全一致。
+        self.assertEqual(result, self.app.supplier_record("北辰"))
+        self.assertEqual(result["supplier"], "北辰")
+        self.assertEqual((result["contact"], result["phone"], result["note"]), ("李", "123", "保留"))
+        self.assertEqual([row["reference"] for row in result["purchases"]], ["P1", "P2", "P3"])
+
+        progress = {ref: self.app.purchase_progress(ref) for ref in ("P1", "P2", "P3")}
+        self.assertEqual(progress["P1"]["status"], "open")
+        self.assertEqual(progress["P1"]["progress"], "partial")
+        self.assertEqual(progress["P1"]["rows"], [{
+            "code": "BOX", "name": "纸箱", "unit": "个", "quantity": 7,
+            "received": 3, "returned": 1, "net_received": 2, "remaining": 4,
+        }])
+        self.assertEqual(progress["P2"]["status"], "open")
+        self.assertEqual(progress["P2"]["progress"], "pending")
+        self.assertEqual(progress["P2"]["rows"][0]["remaining"], 5)
+        self.assertEqual(progress["P3"]["status"], "cancelled")
+        self.assertEqual(progress["P3"]["progress"], "pending")
+        self.assertEqual(progress["P3"]["rows"][0]["remaining"], 2)
+
+        # 北辰包装与 P4 保持原样。
+        packing = self.app.supplier_record("北辰包装")
+        self.assertEqual((packing["contact"], packing["phone"], packing["note"]), ("", "", ""))
+        self.assertEqual([row["reference"] for row in packing["purchases"]], ["P4"])
+        self.assertEqual(packing["purchases"][0]["supplier"], "北辰包装")
+        self.assertEqual(packing["purchases"][0]["rows"][0]["remaining"], 1)
+
+        # 库存、物料资料、最低库存不变。
+        self.assertEqual(self.app.stock("BOX"),
+                         {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": 2})
+        self.assertEqual(self.app.shortages(), [{
+            "code": "BOX", "name": "纸箱", "unit": "个",
+            "quantity": 2, "minimum": 10, "shortage": 8,
+        }])
+
+        # 单据编号、状态、物料快照与明细顺序保持原样；迁入单据仅供应商改名。
+        for ref in ("P1", "P3"):
+            order = self.app.purchase_order(ref)
+            before = snapshots_before[ref]
+            self.assertEqual(order["supplier"], "北辰")
+            self.assertEqual({key: before[key] for key in ("reference", "status", "rows")},
+                             {key: order[key] for key in ("reference", "status", "rows")})
+        for ref in ("P2", "P4"):
+            self.assertEqual(self.app.purchase_order(ref), snapshots_before[ref])
+        self.assertEqual(self.app.purchase_receipts("P1"), receipts_before)
+        self.assertEqual(self.app.purchase_returns("P1"), returns_before)
+        self.assertEqual([
+            (row["reference"], row["kind"], row["purchase_reference"],
+             row["related_reference"], row["quantity"], row["balance"])
+            for row in self.app.movement_ledger("BOX")
+        ], [
+            ("RCV-1", "purchase_receipt", "P1", None, 3, 3),
+            ("RET-1", "purchase_return", "P1", "RCV-1", -1, 2),
+        ])
+
+        # 采购筛选与补货来源显示迁入单据的新供应商。
+        filtered = {item["reference"]: item["supplier"]
+                    for item in self.app.purchase_orders(supplier="北辰")}
+        self.assertEqual(filtered, {"P1": "北辰", "P2": "北辰", "P3": "北辰", "P4": "北辰包装"})
+        self.assertEqual(self.app.purchase_orders(supplier="北辰旧名"), [])
+        plan = self.app.replenishment_plan()
+        self.assertEqual(len(plan), 1)
+        self.assertEqual((plan[0]["quantity"], plan[0]["minimum"], plan[0]["shortage"],
+                          plan[0]["incoming"], plan[0]["suggested"]), (2, 10, 8, 10, 0))
+        self.assertEqual(plan[0]["purchases"], [
+            {"reference": "P1", "supplier": "北辰", "remaining": 4},
+            {"reference": "P2", "supplier": "北辰", "remaining": 5},
+            {"reference": "P4", "supplier": "北辰包装", "remaining": 1},
+        ])
+
+        # 列表不再含旧名，精确查询旧名失败。
+        self.assertEqual({item["supplier"] for item in self.app.suppliers()}, {"北辰", "北辰包装"})
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("北辰旧名")
+
+        # 重新打开同一目录后结果一致。
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.supplier_record("北辰"), result)
+        self.assertEqual({item["supplier"] for item in reopened.suppliers()}, {"北辰", "北辰包装"})
+        self.assertEqual(reopened.stock("BOX")["quantity"], 2)
+        self.assertEqual(reopened.purchase_progress("P1")["rows"][0]["net_received"], 2)
+        with self.assertRaises(ValueError):
+            reopened.supplier_record("北辰旧名")
+
+        # 已消失的来源不能再次合并；通过既有采购入口重新使用旧名仍被允许。
+        with self.assertRaises(ValueError):
+            reopened.merge_supplier("北辰旧名", "北辰")
+        reopened.create_purchase("P5", "北辰旧名", [{"code": "BOX", "quantity": 1}])
+        reborn = reopened.supplier_record("北辰旧名")
+        self.assertEqual((reborn["contact"], reborn["phone"], reborn["note"]), ("", "", ""))
+        self.assertEqual([row["reference"] for row in reborn["purchases"]], ["P5"])
+
+    def test_only_source_profile_is_kept_when_target_has_none(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("Q1", "南", [{"code": "BOX", "quantity": 1}])
+        self.app.save_supplier("南档", contact="赵", phone="9", note="来源备注")
+        result = self.app.merge_supplier("南档", "南")
+        self.assertEqual((result["contact"], result["phone"], result["note"]), ("赵", "9", "来源备注"))
+        self.assertEqual([row["reference"] for row in result["purchases"]], ["Q1"])
+        self.assertEqual(self.app.supplier_record("南"), result)
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("南档")
+        self.assertEqual(StockRoom(self.root).supplier_record("南")["contact"], "赵")
+
+    def test_target_profile_is_retained_when_source_has_none(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("Q1", "东旧", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("Q2", "东", [{"code": "BOX", "quantity": 2}])
+        self.app.save_supplier("东", contact="钱", phone="8", note="目标备注")
+        result = self.app.merge_supplier("东旧", "东")
+        self.assertEqual((result["contact"], result["phone"], result["note"]), ("钱", "8", "目标备注"))
+        self.assertEqual([row["reference"] for row in result["purchases"]], ["Q1", "Q2"])
+
+    def test_purchases_only_merge_keeps_empty_contacts_without_empty_profile(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("Q1", "西旧", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("Q2", "西", [{"code": "BOX", "quantity": 2}])
+        result = self.app.merge_supplier("西旧", "西")
+        self.assertEqual((result["contact"], result["phone"], result["note"]), ("", "", ""))
+        self.assertEqual([row["reference"] for row in result["purchases"]], ["Q1", "Q2"])
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("suppliers", raw)
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("西旧")
+
+    def test_legacy_data_without_receipts_or_returns_counts_zero(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("P1", "北辰旧名", [{"code": "BOX", "quantity": 7}])
+        self.app.receive_purchase("P1", [{"code": "BOX", "quantity": 3, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 1, "RET-1")
+        self.app.create_purchase("P2", "北辰", [{"code": "BOX", "quantity": 5}])
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        raw.pop("purchase_receipts", None)
+        raw.pop("purchase_returns", None)
+        self.app.path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        result = reopened.merge_supplier("北辰旧名", "北辰")
+        p1 = next(row for row in result["purchases"] if row["reference"] == "P1")
+        self.assertEqual(p1["progress"], "pending")
+        self.assertEqual((p1["rows"][0]["received"], p1["rows"][0]["returned"],
+                          p1["rows"][0]["net_received"], p1["rows"][0]["remaining"]), (0, 0, 0, 7))
+        # 收退库存流水本身仍在，库存不受合并影响。
+        self.assertEqual(reopened.stock("BOX")["quantity"], 2)
+
+    def test_invalid_requests_preserve_bytes_and_business_results(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        for source, target in (
+            (None, "北辰"),
+            (7, "北辰"),
+            (["北辰旧名"], "北辰"),
+            (True, "北辰"),
+            ("   ", "北辰"),
+            ("北辰旧名", None),
+            ("北辰旧名", 8),
+            ("北辰旧名", "  "),
+            ("幽灵", "北辰"),
+            ("北辰旧名", "幽灵"),
+            ("  北辰  ", "北辰"),
+        ):
+            with self.subTest(source=source, target=target):
+                with self.assertRaises(ValueError):
+                    self.app.merge_supplier(source, target)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.purchase_order("P1")["supplier"], "北辰旧名")
+        record = self.app.supplier_record("北辰")
+        self.assertEqual((record["contact"], record["phone"], record["note"]), ("李", "", "保留"))
+        self.assertEqual(self.app.supplier_record("北辰旧名")["contact"], "张")
+        self.assertEqual(self.app.stock("BOX")["quantity"], 2)
+
+    def test_names_located_after_strip_with_internal_whitespace_and_case(self):
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("S1", "北 辰", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("S2", "北辰", [{"code": "BOX", "quantity": 2}])
+        result = self.app.merge_supplier(" 北 辰 ", " 北辰 ")
+        self.assertEqual([row["reference"] for row in result["purchases"]], ["S1", "S2"])
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("北 辰")
+        self.app.create_purchase("A1", "Alpha", [{"code": "BOX", "quantity": 1}])
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("alpha", "Alpha")
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("Alpha", "  Alpha  ")
+
+    def test_failed_merge_on_empty_directory_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        for source, target in (
+            (None, "A"),
+            ("   ", "A"),
+            ("A", "B"),
+            ("A", "A"),
+        ):
+            with self.subTest(source=source, target=target):
+                with self.assertRaises(ValueError):
+                    app.merge_supplier(source, target)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_cli_merge_success_failure_and_array_partial_success(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("merge.json", {"source": "北辰旧名", "target": "北辰"})
+        result = self.run_cli("merge-supplier", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        merged = json.loads(result.stdout)
+        self.assertEqual((merged["contact"], merged["phone"], merged["note"]), ("李", "123", "保留"))
+        self.assertEqual([row["reference"] for row in merged["purchases"]], ["P1", "P2", "P3"])
+        query = self.write_payload("record.json", {"supplier": "北辰"})
+        queried = self.run_cli("supplier-record", query)
+        self.assertEqual(queried.returncode, 0, queried.stderr)
+        self.assertEqual(json.loads(queried.stdout), merged)
+
+        # 来源已消失：失败 JSON 走标准错误，退出码 2，标准输出为空。
+        failed = self.run_cli("merge-supplier", payload)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
+        # JSON 数组前项成功、后项失败：前项持久保存，后项不改变台账。
+        self.app.create_purchase("N1", "南甲", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("N2", "南乙", [{"code": "BOX", "quantity": 1}])
+        array_payload = self.write_payload("array.json", [
+            {"source": "南甲", "target": "南乙"},
+            {"source": "幽灵", "target": "南乙"},
+        ])
+        array_result = self.run_cli("merge-supplier", array_payload)
+        self.assertEqual(array_result.returncode, 2)
+        self.assertEqual(array_result.stdout, "")
+        self.assertIn("error", json.loads(array_result.stderr))
+        south = self.app.supplier_record("南乙")
+        self.assertEqual([row["reference"] for row in south["purchases"]], ["N1", "N2"])
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("南甲")
+
+        # 无数据目录上拒绝合并不创建文件。
+        empty = self.root / "empty"
+        empty.mkdir()
+        empty_payload = empty / "merge.json"
+        empty_payload.write_text(json.dumps({"source": "A", "target": "B"}), encoding="utf-8")
+        empty_result = subprocess.run(
+            [sys.executable, "-m", "stock_room", "--root", str(empty),
+             "merge-supplier", str(empty_payload)],
+            text=True, capture_output=True)
+        self.assertEqual(empty_result.returncode, 2)
+        self.assertIn("error", json.loads(empty_result.stderr))
+        self.assertFalse((empty / "data.json").exists())
