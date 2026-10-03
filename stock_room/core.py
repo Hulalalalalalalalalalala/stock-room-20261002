@@ -1005,6 +1005,25 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["reference"])
         return items
 
+    def export_purchases_csv(self, supplier="", status=None, progress=None):
+        orders = self.purchase_orders(supplier=supplier, status=status, progress=progress)
+        lines = ["reference,supplier,status,progress,code,name,unit,quantity,received,returned,net_received,remaining"]
+        for order in orders:
+            head = [order["reference"], order["supplier"], order["status"], order["progress"]]
+            for row in order["rows"]:
+                fields = head + [
+                    row["code"],
+                    row["name"],
+                    row["unit"],
+                    str(row["quantity"]),
+                    str(row["received"]),
+                    str(row["returned"]),
+                    str(row["net_received"]),
+                    str(row["remaining"]),
+                ]
+                lines.append(",".join(_csv_field(value) for value in fields))
+        return "\n".join(lines) + "\n"
+
     def save_supplier(self, supplier, contact="", phone="", note=""):
         supplier = text(supplier, "supplier")
         contact = optional_text(contact, "contact")
