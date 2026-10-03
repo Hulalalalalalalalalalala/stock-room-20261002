@@ -1053,6 +1053,40 @@ class StockRoom(JsonStore):
         purchases.sort(key=lambda item: item["reference"])
         return {**record, "purchases": purchases}
 
+    def merge_supplier(self, source, target):
+        source = text(source, "source")
+        target = text(target, "target")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        orders = data.get("purchases", [])
+
+        def has_supplier(name):
+            if name in profiles:
+                return True
+            return any(order["supplier"] == name for order in orders)
+
+        if source == target:
+            raise ValueError("source and target must be different suppliers")
+        if not has_supplier(source):
+            raise ValueError("unknown supplier")
+        if not has_supplier(target):
+            raise ValueError("unknown supplier")
+        source_profile = profiles.get(source)
+        target_profile = profiles.get(target)
+        for order in orders:
+            if order["supplier"] == source:
+                order["supplier"] = target
+        if source_profile is not None or target_profile is not None:
+            merged = {"supplier": target}
+            for field in ("contact", "phone", "note"):
+                target_value = target_profile.get(field, "") if target_profile is not None else ""
+                source_value = source_profile.get(field, "") if source_profile is not None else ""
+                merged[field] = target_value if target_value else source_value
+            profiles[target] = merged
+            profiles.pop(source, None)
+        self._write(data)
+        return self.supplier_record(target)
+
     def _purchase_progress(self, data, order):
         purchase_reference = order["reference"]
         received = self._received_totals(data, purchase_reference)
