@@ -923,6 +923,46 @@ class StockRoom(JsonStore):
         self._commit_purchase_returns(data, planned)
         return [self._return_record(record) for record in planned]
 
+    def import_purchase_returns_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 3 or set(header) != {"receipt_reference", "quantity", "reference"}:
+            raise ValueError("header must contain exactly the receipt_reference, quantity and reference columns")
+        positions = {name: header.index(name) for name in ("receipt_reference", "quantity", "reference")}
+        entries = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 3:
+                raise ValueError("each record must have exactly three columns")
+            receipt_reference = row[positions["receipt_reference"]].strip()
+            reference = row[positions["reference"]].strip()
+            quantity_text = row[positions["quantity"]].strip()
+            if not receipt_reference:
+                raise ValueError("receipt_reference must be a nonempty string")
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            if not quantity_text or any(char < "0" or char > "9" for char in quantity_text):
+                raise ValueError("quantity must be a positive integer")
+            quantity = int(quantity_text)
+            if quantity == 0:
+                raise ValueError("quantity must be a positive integer")
+            entries.append({"receipt_reference": receipt_reference, "quantity": quantity, "reference": reference})
+        if not entries:
+            return []
+        data = self._read()
+        planned = self._plan_purchase_returns(data, entries)
+        self._commit_purchase_returns(data, planned)
+        return [self._return_record(record) for record in planned]
+
     def preview_purchase_returns(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
