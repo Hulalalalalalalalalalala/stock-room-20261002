@@ -4795,6 +4795,178 @@ class MergeSupplierCliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reopened.supplier_record("北辰旧名")
 
+class SupplierChangeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+
+    def profile(self, supplier, contact="", phone="", note=""):
+        return {"supplier": supplier, "contact": contact, "phone": phone, "note": note}
+
+    def test_save_repeat_merge_and_recreate_sequence(self):
+        self.app.save_supplier("甲", contact="张三")
+        self.app.save_supplier("乙")
+        # Repeat save with identical data succeeds without growing history.
+        self.app.save_supplier("甲", contact="张三")
+        self.assertEqual(
+            self.app.supplier_changes("甲"),
+            [{"supplier": "甲", "sequence": 1, "action": "save_supplier", "related_supplier": None,
+              "before": None, "after": self.profile("甲", contact="张三")}],
+        )
+        self.assertEqual(
+            self.app.supplier_changes("乙"),
+            [{"supplier": "乙", "sequence": 1, "action": "save_supplier", "related_supplier": None,
+              "before": None, "after": self.profile("乙")}],
+        )
+        self.app.merge_supplier("甲", "乙")
+        source_history = self.app.supplier_changes("甲")
+        self.assertEqual(len(source_history), 2)
+        self.assertEqual(source_history[1], {
+            "supplier": "甲", "sequence": 2, "action": "merge_supplier", "related_supplier": "乙",
+            "before": self.profile("甲", contact="张三"), "after": None,
+        })
+        target_history = self.app.supplier_changes("乙")
+        self.assertEqual(len(target_history), 2)
+        self.assertEqual(target_history[1], {
+            "supplier": "乙", "sequence": 2, "action": "merge_supplier", "related_supplier": "甲",
+            "before": self.profile("乙"), "after": self.profile("乙", contact="张三"),
+        })
+        # Re-establishing the old name continues its original sequence.
+        self.app.save_supplier("甲", contact="李四")
+        self.assertEqual(
+            self.app.supplier_changes("甲")[2],
+            {"supplier": "甲", "sequence": 3, "action": "save_supplier", "related_supplier": None,
+             "before": None, "after": self.profile("甲", contact="李四")},
+        )
+
+    def test_history_survives_reopen_and_later_business_keeps_old_snapshots(self):
+        self.app.save_supplier("甲", contact="张三")
+        self.app.save_supplier("乙")
+        self.app.merge_supplier("甲", "乙")
+        history = self.app.supplier_changes("甲")
+        self.assertEqual(StockRoom(self.root).supplier_changes("甲"), history)
+        self.app.save_supplier("乙", contact="王五")
+        self.app.save_supplier("甲", contact="李四")
+        self.assertEqual(self.app.supplier_changes("甲")[:2], history)
+        target = self.app.supplier_changes("乙")
+        self.assertEqual(target[1]["after"], self.profile("乙", contact="张三"))
+        self.assertEqual(target[2]["after"], self.profile("乙", contact="王五"))
+
+    def test_merge_records_only_changed_sides(self):
+        # Neither side has a profile: no records at all.
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("P1", "无档甲", [{"code": "BOX", "quantity": 1}])
+        self.app.create_purchase("P2", "无档乙", [{"code": "BOX", "quantity": 1}])
+        self.app.merge_supplier("无档甲", "无档乙")
+        self.assertEqual(self.app.supplier_changes("无档乙"), [])
+        with self.assertRaises(ValueError):
+            self.app.supplier_changes("无档甲")
+        # Source profile only: source deletion and target creation recorded.
+        self.app.save_supplier("仅有源", contact="赵")
+        self.app.create_purchase("P3", "仅采购", [{"code": "BOX", "quantity": 1}])
+        self.app.merge_supplier("仅有源", "仅采购")
+        self.assertEqual(self.app.supplier_changes("仅有源")[-1]["after"], None)
+        target = self.app.supplier_changes("仅采购")
+        self.assertEqual(len(target), 1)
+        self.assertEqual(target[0]["before"], None)
+        self.assertEqual(target[0]["after"], self.profile("仅采购", contact="赵"))
+        # Target profile unchanged by the merge: only the source is recorded.
+        self.app.save_supplier("满档", contact="钱", phone="8", note="留")
+        self.app.save_supplier("空档")
+        before_count = len(self.app.supplier_changes("满档"))
+        self.app.merge_supplier("空档", "满档")
+        self.assertEqual(len(self.app.supplier_changes("满档")), before_count)
+        self.assertEqual(self.app.supplier_changes("空档")[-1]["after"], None)
+
+    def test_gone_name_queryable_but_not_listed_or_mergeable(self):
+        self.app.save_supplier("旧名", contact="张")
+        self.app.save_supplier("新名")
+        self.app.merge_supplier("旧名", "新名")
+        self.assertEqual(len(self.app.supplier_changes("旧名")), 2)
+        self.assertEqual([item["supplier"] for item in self.app.suppliers()], ["新名"])
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("旧名", "新名")
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("新名", "旧名")
+
+    def test_invalid_and_unknown_names_rejected_without_writes(self):
+        self.app.save_supplier("甲", contact="张三")
+        before = self.app.path.read_bytes()
+        for bad in ("", "   ", 1, None, True, [], {}, "幽灵"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.app.supplier_changes(bad)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = StockRoom(self.root / "empty")
+        with self.assertRaises(ValueError):
+            empty.supplier_changes("甲")
+        self.assertFalse((self.root / "empty" / "data.json").exists())
+
+    def test_query_does_not_write_and_returns_independent_copies(self):
+        self.app.save_supplier("甲", contact="张三")
+        before = self.app.path.read_bytes()
+        rows = self.app.supplier_changes("甲")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        rows[0]["after"]["contact"] = "篡改"
+        rows[0]["action"] = "tampered"
+        fresh = self.app.supplier_changes("甲")
+        self.assertEqual(fresh[0]["action"], "save_supplier")
+        self.assertEqual(fresh[0]["after"]["contact"], "张三")
+
+    def test_legacy_data_first_change_uses_actual_old_profile(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({
+            "suppliers": {"旧": {"supplier": "旧", "contact": "老", "phone": "1", "note": ""}},
+        }, ensure_ascii=False), encoding="utf-8")
+        app = StockRoom(legacy)
+        self.assertEqual(app.supplier_changes("旧"), [])
+        app.save_supplier("旧", contact="新")
+        changes = StockRoom(legacy).supplier_changes("旧")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["sequence"], 1)
+        self.assertEqual(changes[0]["before"], self.profile("旧", contact="老", phone="1"))
+        self.assertEqual(changes[0]["after"], self.profile("旧", contact="新"))
+
+    def test_failed_save_and_merge_append_nothing(self):
+        self.app.save_supplier("甲", contact="张三")
+        self.app.save_supplier("乙")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.save_supplier("  ", contact="x")
+        with self.assertRaises(ValueError):
+            self.app.save_supplier("甲", contact=1)
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("幽灵", "乙")
+        with self.assertRaises(ValueError):
+            self.app.merge_supplier("甲", "甲")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.supplier_changes("甲")), 1)
+
+    def test_cli_success_failure_and_array_processing(self):
+        self.app.save_supplier("甲", contact="张三")
+        query = self.root / "query.json"
+        query.write_text(json.dumps({"supplier": "甲"}), encoding="utf-8")
+        ok = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "supplier-changes", str(query)],
+                            text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(len(json.loads(ok.stdout)), 1)
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"supplier": "幽灵"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "supplier-changes", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([{"supplier": "甲"}, {"supplier": "幽灵"}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "supplier-changes", str(batch)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+
+
 class MaterialChangeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
