@@ -196,8 +196,12 @@ class StockRoom(JsonStore):
                 raise ValueError("unit cannot change after stock history exists")
             if any(row["code"] == code for row in data.get("reversals", [])):
                 raise ValueError("unit cannot change after stock history exists")
+        before = self._material_profile(data, code)
         materials[code]["name"] = name
         materials[code]["unit"] = unit
+        after = self._material_profile(data, code)
+        if before != after:
+            self._record_material_change(data, code, "update_material", before, after)
         self._write(data)
         return {"code": code, "name": name, "unit": unit}
 
@@ -1255,7 +1259,11 @@ class StockRoom(JsonStore):
         data = self._read()
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
+        before = self._material_profile(data, code)
         data.setdefault("status", {})[code] = active
+        after = self._material_profile(data, code)
+        if before != after:
+            self._record_material_change(data, code, "set_active", before, after)
         self._write(data)
         return {"code": code, "active": active}
 
@@ -1266,6 +1274,23 @@ class StockRoom(JsonStore):
             raise ValueError("unknown material")
         return {"code": code, "active": data.get("status", {}).get(code, True)}
 
+    def material_changes(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return [
+            {
+                "code": row["code"],
+                "sequence": row["sequence"],
+                "action": row["action"],
+                "before": dict(row["before"]),
+                "after": dict(row["after"]),
+            }
+            for row in data.get("material_changes", [])
+            if row["code"] == code
+        ]
+
     def set_minimum(self, code, minimum):
         code = text(code, "code")
         if type(minimum) is not int or minimum < 0:
@@ -1273,7 +1298,11 @@ class StockRoom(JsonStore):
         data = self._read()
         if code not in data.get("materials", {}):
             raise ValueError("unknown material")
+        before = self._material_profile(data, code)
         data.setdefault("minimums", {})[code] = minimum
+        after = self._material_profile(data, code)
+        if before != after:
+            self._record_material_change(data, code, "set_minimum", before, after)
         self._write(data)
         return {"code": code, "minimum": minimum}
 
@@ -1379,6 +1408,33 @@ class StockRoom(JsonStore):
             })
         items.sort(key=lambda item: item["code"])
         return items
+
+    @staticmethod
+    def _material_profile(data, code):
+        # The effective catalog profile of a material: unset minimums and
+        # statuses in older data read as 0 and True.
+        material = data["materials"][code]
+        return {
+            "name": material["name"],
+            "unit": material["unit"],
+            "minimum": data.get("minimums", {}).get(code, 0),
+            "active": data.get("status", {}).get(code, True),
+        }
+
+    @staticmethod
+    def _record_material_change(data, code, action, before, after):
+        # Append one catalog change record; sequences are per material and
+        # start at 1. Snapshots are plain value dicts, so later business
+        # cannot rewrite them.
+        changes = data.setdefault("material_changes", [])
+        sequence = sum(1 for row in changes if row["code"] == code) + 1
+        changes.append({
+            "code": code,
+            "sequence": sequence,
+            "action": action,
+            "before": before,
+            "after": after,
+        })
 
     @staticmethod
     def _require_unique_reference(data, reference):

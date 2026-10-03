@@ -4561,3 +4561,176 @@ class MergeSupplierCliTests(unittest.TestCase):
         self.assertEqual(reopened.purchase_order("P4")["supplier"], "北辰包装")
         with self.assertRaises(ValueError):
             reopened.supplier_record("北辰旧名")
+
+
+class MaterialChangesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("BOX", "纸箱", "个")
+
+    def test_sample_scenario_survives_reopen(self):
+        self.app.update_material("BOX", "周转箱", "个")
+        self.app.set_minimum("BOX", 5)
+        self.app.set_active("BOX", False)
+        self.app.set_active("BOX", False)
+        changes = StockRoom(self.root).material_changes("BOX")
+        self.assertEqual([row["sequence"] for row in changes], [1, 2, 3])
+        self.assertEqual([row["action"] for row in changes], ["update_material", "set_minimum", "set_active"])
+        self.assertTrue(all(set(row) == {"code", "sequence", "action", "before", "after"} for row in changes))
+        self.assertTrue(all(row["code"] == "BOX" for row in changes))
+        self.assertEqual(changes[0]["before"], {"name": "纸箱", "unit": "个", "minimum": 0, "active": True})
+        self.assertEqual(changes[0]["after"], {"name": "周转箱", "unit": "个", "minimum": 0, "active": True})
+        self.assertEqual(changes[1]["before"], changes[0]["after"])
+        self.assertEqual(changes[1]["after"], {"name": "周转箱", "unit": "个", "minimum": 5, "active": True})
+        self.assertEqual(changes[2]["before"], changes[1]["after"])
+        self.assertEqual(changes[2]["after"], {"name": "周转箱", "unit": "个", "minimum": 5, "active": False})
+
+    def test_registered_without_changes_returns_empty_list(self):
+        self.assertEqual(self.app.material_changes("BOX"), [])
+        self.app.set_minimum("BOX", 0)
+        self.app.set_active("BOX", True)
+        self.assertEqual(self.app.material_changes("BOX"), [])
+
+    def test_repeated_same_values_add_no_record(self):
+        self.app.update_material("BOX", "周转箱", "个")
+        self.app.update_material("BOX", "周转箱", "个")
+        self.app.set_minimum("BOX", 5)
+        self.app.set_minimum("BOX", 5)
+        self.app.set_active("BOX", False)
+        self.app.set_active("BOX", False)
+        self.assertEqual([row["sequence"] for row in self.app.material_changes("BOX")], [1, 2, 3])
+
+    def test_name_and_unit_change_produces_single_record(self):
+        self.app.update_material("BOX", "周转箱", "箱")
+        changes = self.app.material_changes("BOX")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "update_material")
+        self.assertEqual(changes[0]["before"], {"name": "纸箱", "unit": "个", "minimum": 0, "active": True})
+        self.assertEqual(changes[0]["after"], {"name": "周转箱", "unit": "箱", "minimum": 0, "active": True})
+
+    def test_sequences_are_per_material(self):
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.set_minimum("BOX", 5)
+        self.app.set_minimum("PAPER", 15)
+        self.app.set_active("BOX", False)
+        self.assertEqual([row["sequence"] for row in self.app.material_changes("BOX")], [1, 2])
+        self.assertEqual([row["sequence"] for row in self.app.material_changes("PAPER")], [1])
+
+    def test_inactive_material_still_queryable(self):
+        self.app.set_active("BOX", False)
+        changes = self.app.material_changes("BOX")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["after"]["active"], False)
+
+    def test_query_strips_surrounding_whitespace_and_matches_case(self):
+        self.app.set_minimum("BOX", 5)
+        self.assertEqual(len(self.app.material_changes("  BOX  ")), 1)
+        with self.assertRaises(ValueError):
+            self.app.material_changes("box")
+
+    def test_invalid_query_rejected(self):
+        for code in ("", "   ", 11, None, True, ["BOX"], "UNKNOWN"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.material_changes(code)
+
+    def test_query_does_not_write_file(self):
+        self.app.set_minimum("BOX", 5)
+        before = self.app.path.read_bytes()
+        self.app.material_changes("BOX")
+        with self.assertRaises(ValueError):
+            self.app.material_changes("UNKNOWN")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_query_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.material_changes("BOX")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_failed_change_preserves_history_and_file(self):
+        self.app.set_minimum("BOX", 5)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.set_minimum("BOX", -1)
+        with self.assertRaises(ValueError):
+            self.app.set_active("BOX", 1)
+        with self.assertRaises(ValueError):
+            self.app.update_material("BOX", "", "个")
+        with self.assertRaises(ValueError):
+            self.app.update_material("UNKNOWN", "x", "个")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(len(self.app.material_changes("BOX")), 1)
+
+    def test_snapshots_not_rewritten_by_later_business(self):
+        self.app.set_minimum("BOX", 5)
+        self.app.set_minimum("BOX", 8)
+        self.app.update_material("BOX", "周转箱", "个")
+        changes = self.app.material_changes("BOX")
+        self.assertEqual(changes[0]["after"]["minimum"], 5)
+        self.assertEqual(changes[1]["before"]["minimum"], 5)
+        self.assertEqual(changes[1]["after"]["minimum"], 8)
+        self.assertEqual(changes[2]["before"]["name"], "纸箱")
+
+    def test_registration_and_import_generate_no_records(self):
+        self.app.import_materials_csv("code,name,unit\nPAPER,包装纸,张\n")
+        self.assertEqual(self.app.material_changes("BOX"), [])
+        self.assertEqual(self.app.material_changes("PAPER"), [])
+
+    def test_change_records_do_not_lock_unit_change_or_enter_ledgers(self):
+        self.app.set_minimum("BOX", 5)
+        self.app.set_active("BOX", False)
+        self.app.set_active("BOX", True)
+        # Change records are not stock history: the unit may still change.
+        self.app.update_material("BOX", "纸箱", "箱")
+        self.assertEqual(self.app.history("BOX"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        self.assertEqual(self.app.reversals("BOX"), [])
+        self.assertEqual(self.app.movement_ledger("BOX"), [])
+
+    def test_old_data_without_history_reads_as_empty(self):
+        self.app.set_minimum("BOX", 5)
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        del data["material_changes"]
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.material_changes("BOX"), [])
+        # New changes after old data start at sequence 1 with default profile.
+        reopened.set_active("BOX", False)
+        changes = reopened.material_changes("BOX")
+        self.assertEqual(changes[0]["sequence"], 1)
+        self.assertEqual(changes[0]["before"], {"name": "纸箱", "unit": "个", "minimum": 5, "active": True})
+
+    def test_cli_material_changes(self):
+        self.app.update_material("BOX", "周转箱", "个")
+        self.app.set_minimum("BOX", 5)
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"code": "BOX"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "material-changes", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        changes = json.loads(result.stdout)
+        self.assertEqual([row["sequence"] for row in changes], [1, 2])
+        self.assertEqual(changes[1]["after"]["minimum"], 5)
+
+    def test_cli_material_changes_unknown_returns_2(self):
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"code": "UNKNOWN"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "material-changes", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", result.stderr)
+
+    def test_cli_array_commits_independently(self):
+        payload = self.root / "batch.json"
+        payload.write_text(json.dumps([
+            {"code": "BOX", "minimum": 5},
+            {"code": "UNKNOWN", "minimum": 1},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), "set-minimum", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        changes = StockRoom(self.root).material_changes("BOX")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "set_minimum")
