@@ -1212,6 +1212,59 @@ class StockRoom(JsonStore):
         self._write(data)
         return dict(record)
 
+    def import_suppliers_csv(self, content):
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 4 or set(header) != {"supplier", "contact", "phone", "note"}:
+            raise ValueError("header must contain exactly the supplier, contact, phone and note columns")
+        positions = {name: header.index(name) for name in ("supplier", "contact", "phone", "note")}
+        records = []
+        seen = set()
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 4:
+                raise ValueError("each record must have exactly four columns")
+            supplier = row[positions["supplier"]].strip()
+            if not supplier:
+                raise ValueError("supplier must be a nonempty string")
+            fields = {
+                "supplier": supplier,
+                "contact": row[positions["contact"]].strip(),
+                "phone": row[positions["phone"]].strip(),
+                "note": row[positions["note"]].strip(),
+            }
+            if supplier in seen:
+                raise ValueError("supplier already exists in batch")
+            seen.add(supplier)
+            records.append(fields)
+        if not records:
+            return []
+        data = self._read()
+        profiles = data.setdefault("suppliers", {})
+        changed = False
+        results = []
+        for fields in records:
+            name = fields["supplier"]
+            before = self._supplier_snapshot(profiles.get(name), name)
+            record = {"supplier": name, "contact": fields["contact"], "phone": fields["phone"], "note": fields["note"]}
+            results.append(dict(record))
+            if before != record:
+                profiles[name] = record
+                self._record_supplier_change(data, name, "save_supplier", None, before, record)
+                changed = True
+        if changed:
+            self._write(data)
+        return results
+
     def suppliers(self, keyword=""):
         keyword = optional_text(keyword, "keyword")
         data = self._read()

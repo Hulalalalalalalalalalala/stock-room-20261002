@@ -4967,6 +4967,255 @@ class SupplierChangeTests(unittest.TestCase):
         self.assertIn("error", json.loads(result.stderr))
 
 
+class ImportSuppliersCsvTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("BOX", "纸箱", "个")
+        # 北辰 already has a profile with phone 001; 北辰包装 has only a purchase.
+        self.app.save_supplier("北辰", contact="李", phone="001", note="保留")
+        self.app.create_purchase("P1", "北辰包装", [{"code": "BOX", "quantity": 3}])
+
+    def profile(self, supplier, contact="", phone="", note=""):
+        return {"supplier": supplier, "contact": contact, "phone": phone, "note": note}
+
+    def test_fixed_sample_clears_phone_creates_purchase_only_and_records_history(self):
+        content = "supplier,contact,phone,note\n北辰,李,,保留\n北辰包装,王,002,\n"
+        result = self.app.import_suppliers_csv(content)
+        self.assertEqual(result, [
+            self.profile("北辰", contact="李", note="保留"),
+            self.profile("北辰包装", contact="王", phone="002"),
+        ])
+        self.assertEqual(self.app.supplier_record("北辰"), {
+            **self.profile("北辰", contact="李", note="保留"),
+            "purchases": [],
+        })
+        packaging = self.app.supplier_record("北辰包装")
+        self.assertEqual(
+            {key: packaging[key] for key in ("contact", "phone", "note")},
+            {"contact": "王", "phone": "002", "note": ""},
+        )
+        self.assertEqual([order["reference"] for order in packaging["purchases"]], ["P1"])
+        beichen = self.app.supplier_changes("北辰")
+        self.assertEqual(len(beichen), 2)
+        self.assertEqual(beichen[1], {
+            "supplier": "北辰", "sequence": 2, "action": "save_supplier", "related_supplier": None,
+            "before": self.profile("北辰", contact="李", phone="001", note="保留"),
+            "after": self.profile("北辰", contact="李", note="保留"),
+        })
+        created = self.app.supplier_changes("北辰包装")
+        self.assertEqual(created, [{
+            "supplier": "北辰包装", "sequence": 1, "action": "save_supplier", "related_supplier": None,
+            "before": None, "after": self.profile("北辰包装", contact="王", phone="002"),
+        }])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.supplier_record("北辰")["phone"], "")
+        self.assertEqual(reopened.supplier_record("北辰包装")["phone"], "002")
+        self.assertEqual(len(reopened.supplier_changes("北辰")), 2)
+        self.assertEqual(len(reopened.supplier_changes("北辰包装")), 1)
+        # Stock and purchase linkage are untouched.
+        self.assertEqual(self.app.stock("BOX")["quantity"], 0)
+        self.assertEqual(self.app.purchase_order("P1")["supplier"], "北辰包装")
+
+    def test_later_row_with_surrounding_whitespace_same_name_fails_entire_file(self):
+        before = self.app.path.read_bytes()
+        # The later row trims to 北辰, the same normalized name as the first
+        # row, so the whole file fails even though its data differs.
+        collision = "supplier,contact,phone,note\n北辰,李,,保留\n  北辰  ,王,002,\n"
+        with self.assertRaises(ValueError):
+            self.app.import_suppliers_csv(collision)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.supplier_record("北辰")["phone"], "001")
+        self.assertEqual(self.app.supplier_record("北辰包装")["phone"], "")
+        self.assertEqual(len(self.app.supplier_changes("北辰")), 1)
+        self.assertEqual(self.app.supplier_changes("北辰包装"), [])
+        # Surrounding whitespace itself is trimmed, not rejected: a padded
+        # distinct name imports under the trimmed name.
+        result = self.app.import_suppliers_csv("supplier,contact,phone,note\n  北辰包装  ,王,002,\n")
+        self.assertEqual(result, [self.profile("北辰包装", contact="王", phone="002")])
+
+    def test_full_replace_clears_fields_and_absent_names_keep_profile(self):
+        self.app.save_supplier("旁观", contact="赵", phone="9", note="不动")
+        result = self.app.import_suppliers_csv(
+            "supplier,contact,phone,note\n北辰,,,\n北辰包装,王,002,备注\n"
+        )
+        self.assertEqual(result, [self.profile("北辰"), self.profile("北辰包装", contact="王", phone="002", note="备注")])
+        self.assertEqual(
+            {key: self.app.supplier_record("北辰")[key] for key in ("contact", "phone", "note")},
+            {"contact": "", "phone": "", "note": ""},
+        )
+        bystander = self.app.supplier_record("旁观")
+        self.assertEqual(
+            {key: bystander[key] for key in ("contact", "phone", "note")},
+            {"contact": "赵", "phone": "9", "note": "不动"},
+        )
+        self.assertEqual(len(self.app.supplier_changes("旁观")), 1)
+
+    def test_identical_reimport_adds_no_history_and_writes_nothing(self):
+        content = "supplier,contact,phone,note\n北辰,李,001,保留\n北辰包装,王,002,x\n"
+        first = self.app.import_suppliers_csv(content)
+        self.assertEqual([row["phone"] for row in first], ["001", "002"])
+        before = self.app.path.read_bytes()
+        again = self.app.import_suppliers_csv("note,supplier,phone,contact\n保留,北辰,001,李\nx,北辰包装,002,王\n")
+        self.assertEqual(again, first)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(len(self.app.supplier_changes("北辰")), 1)
+        self.assertEqual(len(self.app.supplier_changes("北辰包装")), 1)
+        # A batch changing nothing also skips the write on an empty directory.
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_suppliers_csv("supplier,contact,phone,note\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_header_only_and_blank_lines_return_empty_without_writing(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_suppliers_csv("supplier,contact,phone,note\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.import_suppliers_csv("note,phone,supplier,contact\r\n\r\n\r\n"), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_bom_crlf_reordered_header_quoted_fields_and_internal_whitespace(self):
+        content = "﻿note,phone,supplier,contact\r\n备 注,0 0 2, 北 辰 , 王 工 \r\n\r\n\"a,b\",\"00\"\"3\",\"北,辰\",\"李\r\n工\"\r\n"
+        result = self.app.import_suppliers_csv(content)
+        self.assertEqual(result, [
+            self.profile("北 辰", contact="王 工", phone="0 0 2", note="备 注"),
+            self.profile("北,辰", contact="李\r\n工", phone='00"3', note="a,b"),
+        ])
+        self.assertEqual(StockRoom(self.root).supplier_record("北 辰")["contact"], "王 工")
+
+    def test_invalid_content_and_header_rejected(self):
+        for content in ("", "﻿", None, 11, ["supplier"], {"c": "x"}):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_suppliers_csv(content)
+        for content in (
+            "supplier,contact,phone\n",
+            "supplier,contact,phone,note,extra\n",
+            "supplier,supplier,phone,note\n",
+            "supplier,contact,phone,Contact\n",
+            " supplier,contact,phone,note\n",
+            "supplier ,contact,phone,note\n",
+            "Supplier,contact,phone,note\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_suppliers_csv(content)
+
+    def test_invalid_quotes_rejected(self):
+        for content in (
+            'supplier,contact,phone,note\n"北辰,李,1,x\n',
+            'supplier,contact,phone,note\n北"辰,李,1,x\n',
+            'supplier,contact,phone,note\n"北辰"x,李,1,x\n',
+            'supplier,contact,phone,note\n "北辰",李,1,x\n',
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_suppliers_csv(content)
+
+    def test_wrong_column_count_and_empty_name_rejected(self):
+        for content in (
+            "supplier,contact,phone,note\n北辰,李,1\n",
+            "supplier,contact,phone,note\n北辰,李,1,x,多\n",
+            "supplier,contact,phone,note\n,李,1,x\n",
+            "supplier,contact,phone,note\n   ,李,1,x\n",
+            "supplier,contact,phone,note\n北辰,李,1,x,\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_suppliers_csv(content)
+        # Empty contact/phone/note are allowed and phone stays a string.
+        result = self.app.import_suppliers_csv("supplier,contact,phone,note\n新商,,,\n")
+        self.assertEqual(result, [self.profile("新商")])
+        self.assertIsInstance(result[0]["phone"], str)
+
+    def test_duplicate_names_rejected_even_with_identical_data_and_case_sensitive(self):
+        before = self.app.path.read_bytes()
+        for content in (
+            "supplier,contact,phone,note\n甲,李,1,x\n甲,李,1,x\n",
+            "supplier,contact,phone,note\n甲,李,1,x\n 甲  ,王,2,y\n",
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(ValueError):
+                    self.app.import_suppliers_csv(content)
+        self.assertEqual(before, self.app.path.read_bytes())
+        result = self.app.import_suppliers_csv("supplier,contact,phone,note\nNorth,a,b,c\nnorth,d,e,f\n")
+        self.assertEqual([row["supplier"] for row in result], ["North", "north"])
+
+    def test_failed_import_preserves_file_and_all_state(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_suppliers_csv("supplier,contact,phone,note\n新商,李,1,x\n新商,王,2,y\n")
+        with self.assertRaises(ValueError):
+            self.app.import_suppliers_csv("supplier,contact,phone\n新商,李,1\n")
+        with self.assertRaises(ValueError):
+            self.app.import_suppliers_csv(11)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.supplier_record("北辰")["phone"], "001")
+        self.assertEqual(self.app.supplier_record("北辰包装")["phone"], "")
+        self.assertEqual(len(self.app.supplier_changes("北辰")), 1)
+        self.assertEqual(self.app.supplier_changes("北辰包装"), [])
+        self.assertEqual([item["supplier"] for item in self.app.suppliers()], ["北辰", "北辰包装"])
+
+    def test_failed_import_on_empty_directory_creates_no_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.import_suppliers_csv("supplier,contact,phone,note\n甲,李,1\n")
+        with self.assertRaises(ValueError):
+            app.import_suppliers_csv("")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_profile_missing_fields_count_as_empty_and_history_not_fabricated(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({
+            "suppliers": {"旧": {"supplier": "旧"}},
+        }, ensure_ascii=False), encoding="utf-8")
+        app = StockRoom(legacy)
+        self.assertEqual(app.supplier_changes("旧"), [])
+        result = app.import_suppliers_csv("supplier,contact,phone,note\n旧,张,002,注\n")
+        self.assertEqual(result, [self.profile("旧", contact="张", phone="002", note="注")])
+        changes = StockRoom(legacy).supplier_changes("旧")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["sequence"], 1)
+        self.assertEqual(changes[0]["before"], self.profile("旧"))
+        self.assertEqual(changes[0]["after"], self.profile("旧", contact="张", phone="002", note="注"))
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args], text=True, capture_output=True)
+
+    def test_cli_import_success_and_failure(self):
+        payload = self.root / "import.json"
+        payload.write_text(json.dumps({"content": "supplier,contact,phone,note\n北辰,李,,保留\n北辰包装,王,002,\n"}), encoding="utf-8")
+        result = self.run_cli("import-suppliers-csv", str(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["supplier"] for row in json.loads(result.stdout)], ["北辰", "北辰包装"])
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"content": "supplier,contact,phone,note\n幽灵,,,\n幽灵,,,\n"}), encoding="utf-8")
+        failed = self.run_cli("import-suppliers-csv", str(bad))
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("幽灵")
+
+    def test_cli_import_array_keeps_earlier_success(self):
+        payload = self.root / "imports.json"
+        payload.write_text(json.dumps([
+            {"content": "supplier,contact,phone,note\n甲,李,1,x\n"},
+            {"content": "supplier,contact,phone,note\n乙,王,2,y\n乙,赵,3,z\n"},
+        ]), encoding="utf-8")
+        result = self.run_cli("import-suppliers-csv", str(payload))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.supplier_record("甲")["phone"], "1")
+        with self.assertRaises(ValueError):
+            self.app.supplier_record("乙")
+
+
 class MaterialChangeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
