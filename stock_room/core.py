@@ -361,6 +361,38 @@ class StockRoom(JsonStore):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
         data = self._read()
+        parsed = self._plan_counts(data, rows)
+        counts = data.setdefault("counts", [])
+        movements = data.setdefault("movements", [])
+        for record in parsed:
+            counts.append(dict(record))
+            if record["difference"] != 0:
+                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return [dict(record) for record in parsed]
+
+    def preview_counts(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        minimums = data.get("minimums", {})
+        planned = self._plan_counts(data, rows)
+        return [
+            {
+                **dict(record),
+                "before_shortage": max(minimums.get(record["code"], 0) - record["before"], 0),
+                "after_shortage": max(minimums.get(record["code"], 0) - record["counted"], 0),
+            }
+            for record in planned
+        ]
+
+    def _plan_counts(self, data, rows):
+        # Shared batch count rules for the commit and preview paths: each row
+        # is validated in input order against the material registry, the
+        # reference namespace and the batch's own code/reference sets. Stock
+        # is read off the pre-batch ledger, since a material appears at most
+        # once in the batch. Nothing is written here; callers decide whether
+        # to commit the plan or just report it.
         materials = data.get("materials", {})
         existing = data.get("movements", [])
         parsed = []
@@ -385,14 +417,7 @@ class StockRoom(JsonStore):
             seen_codes.add(code)
             seen_references.add(reference)
             parsed.append({"code": code, "reference": reference, "before": before, "counted": counted, "difference": counted - before})
-        counts = data.setdefault("counts", [])
-        movements = data.setdefault("movements", [])
-        for record in parsed:
-            counts.append(dict(record))
-            if record["difference"] != 0:
-                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
-        self._write(data)
-        return [dict(record) for record in parsed]
+        return parsed
 
     def counts(self, code):
         code = text(code, "code")

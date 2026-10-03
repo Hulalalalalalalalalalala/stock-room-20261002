@@ -188,6 +188,242 @@ class CountTests(unittest.TestCase):
         self.assertEqual(len(self.app.counts("PAPER")), 1)
         self.assertEqual(self.app.stock("PAPER")["quantity"], 11)
 
+class PreviewCountsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 12, "IN-001")
+        self.app.movement("BOX", 3, "BOX-IN")
+        self.app.set_minimum("PAPER", 10)
+        self.app.set_minimum("BOX", 5)
+        self.app.set_active("BOX", False)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def rows(self):
+        return [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P"},
+            {"code": "BOX", "counted": 3, "reference": "CNT-B"},
+        ]
+
+    def test_preview_fields_shortages_inactive_and_zero_difference(self):
+        before = self.app.path.read_bytes()
+        result = self.app.preview_counts(self.rows())
+        self.assertEqual(result, [
+            {"code": "PAPER", "reference": "CNT-P", "before": 12, "counted": 8,
+             "difference": -4, "before_shortage": 0, "after_shortage": 2},
+            {"code": "BOX", "reference": "CNT-B", "before": 3, "counted": 3,
+             "difference": 0, "before_shortage": 2, "after_shortage": 2},
+        ])
+        # Preview changes nothing: no records, no stock movement, same bytes.
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001"])
+        self.assertEqual([row["reference"] for row in self.app.history("BOX")], ["BOX-IN"])
+
+    def test_missing_minimum_counts_as_zero(self):
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.movement("TAPE", 4, "TAPE-IN")
+        result = self.app.preview_counts([{"code": "TAPE", "counted": 1, "reference": "CNT-T"}])
+        self.assertEqual(result[0]["before_shortage"], 0)
+        self.assertEqual(result[0]["after_shortage"], 0)
+
+    def test_repeated_preview_is_identical_and_input_unchanged(self):
+        rows = self.rows()
+        first = self.app.preview_counts(rows)
+        second = self.app.preview_counts(json.loads(json.dumps(rows)))
+        self.assertEqual(first, second)
+        self.assertEqual(rows, self.rows())
+
+    def test_preview_then_commit_matches_without_extra_fields(self):
+        preview = self.app.preview_counts(self.rows())
+        committed = self.app.count_batch(self.rows())
+        self.assertEqual(len(preview), len(committed))
+        for previewed, actual in zip(preview, committed):
+            self.assertEqual({key: value for key, value in previewed.items()
+                              if key not in ("before_shortage", "after_shortage")}, actual)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 8)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual([row["reference"] for row in reopened.counts("PAPER")], ["CNT-P"])
+        self.assertEqual([row["reference"] for row in reopened.counts("BOX")], ["CNT-B"])
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")], ["IN-001", "CNT-P"])
+        # Zero-difference count appends no movement.
+        self.assertEqual([row["reference"] for row in reopened.history("BOX")], ["BOX-IN"])
+
+    def test_preview_reopen_adds_no_records(self):
+        self.app.preview_counts(self.rows())
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.counts("PAPER"), [])
+        self.assertEqual(reopened.counts("BOX"), [])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")], ["IN-001"])
+
+    def test_intervening_movement_makes_commit_use_latest_ledger(self):
+        preview = self.app.preview_counts([{"code": "PAPER", "counted": 8, "reference": "CNT-P"}])
+        self.assertEqual(preview[0]["before"], 12)
+        self.app.movement("PAPER", -2, "OUT-002")
+        committed = self.app.count_batch([{"code": "PAPER", "counted": 8, "reference": "CNT-P"}])
+        self.assertEqual(committed[0]["before"], 10)
+        self.assertEqual(committed[0]["difference"], -2)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 8)
+
+    def test_identifiers_are_stripped_and_case_sensitive(self):
+        result = self.app.preview_counts([
+            {"code": "  PAPER  ", "counted": 8, "reference": "  CNT-P  "},
+        ])
+        self.assertEqual(result[0]["code"], "PAPER")
+        self.assertEqual(result[0]["reference"], "CNT-P")
+        with self.assertRaises(ValueError):
+            self.app.preview_counts([{"code": "paper", "counted": 8, "reference": "CNT-LOWER"}])
+        # Internal whitespace is preserved.
+        record = self.app.preview_counts([{"code": "PAPER", "counted": 8, "reference": "CNT P"}])
+        self.assertEqual(record[0]["reference"], "CNT P")
+
+    def test_invalid_rows_shape_rejected(self):
+        before = self.app.path.read_bytes()
+        for rows in (None, {}, "rows", 1, True, []):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.preview_counts(rows)
+        bad_rows = [
+            ["not-an-object"],
+            [None],
+            [[]],
+            [{"code": "PAPER", "counted": 8}],
+            [{"code": "PAPER", "reference": "CNT-1"}],
+            [{"counted": 8, "reference": "CNT-1"}],
+            [{"code": "PAPER", "counted": 8, "reference": "CNT-1", "extra": 1}],
+        ]
+        for rows in bad_rows:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.preview_counts(rows)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_invalid_counted_rejected(self):
+        before = self.app.path.read_bytes()
+        for counted in (-1, True, False, 1.5, "8", None, [8]):
+            with self.subTest(counted=counted):
+                with self.assertRaises(ValueError):
+                    self.app.preview_counts([{"code": "PAPER", "counted": counted, "reference": "CNT-1"}])
+        for code in ("", "   ", 11, None):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError):
+                    self.app.preview_counts([{"code": code, "counted": 8, "reference": "CNT-1"}])
+        for reference in ("", "   ", 11, None):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.preview_counts([{"code": "PAPER", "counted": 8, "reference": reference}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_unknown_material_rejected(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.preview_counts([{"code": "MISSING", "counted": 8, "reference": "CNT-1"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_duplicate_codes_judged_after_stripping(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.preview_counts([
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1"},
+                {"code": "  PAPER  ", "counted": 7, "reference": "CNT-2"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_reference_conflicts_rejected(self):
+        self.app.count("PAPER", 12, "CNT-ZERO")
+        self.app.movement("PAPER", 1, "PAPER-EXTRA")
+        self.app.reverse("PAPER-EXTRA", "REV-1")
+        before = self.app.path.read_bytes()
+        for reference in ("IN-001", "BOX-IN", "PAPER-EXTRA", "CNT-ZERO", "REV-1"):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    self.app.preview_counts([{"code": "PAPER", "counted": 8, "reference": reference}])
+        with self.assertRaises(ValueError):
+            self.app.preview_counts([
+                {"code": "PAPER", "counted": 8, "reference": "DUP"},
+                {"code": "BOX", "counted": 3, "reference": "  DUP  "},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # Purchase references live in their own namespace.
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        after_purchase = self.app.path.read_bytes()
+        result = self.app.preview_counts([{"code": "PAPER", "counted": 8, "reference": "PO-1"}])
+        self.assertEqual(result[0]["reference"], "PO-1")
+        self.assertEqual(self.app.path.read_bytes(), after_purchase)
+
+    def test_failure_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.preview_counts([])
+        with self.assertRaises(ValueError):
+            app.preview_counts([{"code": "PAPER", "counted": 8, "reference": "CNT-1"}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_without_minimums_behaves_as_zero(self):
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("minimums", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        result = reopened.preview_counts(self.rows())
+        self.assertEqual([row["before_shortage"] for row in result], [0, 0])
+        self.assertEqual([row["after_shortage"] for row in result], [0, 0])
+
+    def test_cli_preview_and_failure(self):
+        payload = self.write_payload("preview.json", {"rows": self.rows()})
+        result = self.run_cli("preview-counts", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [
+            {"code": "PAPER", "reference": "CNT-P", "before": 12, "counted": 8,
+             "difference": -4, "before_shortage": 0, "after_shortage": 2},
+            {"code": "BOX", "reference": "CNT-B", "before": 3, "counted": 3,
+             "difference": 0, "before_shortage": 2, "after_shortage": 2},
+        ])
+        # Nothing was registered.
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.counts("PAPER"), [])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        bad = self.write_payload("bad.json", {"rows": [
+            {"code": "PAPER", "counted": 8, "reference": "IN-001"},
+        ]})
+        failed = self.run_cli("preview-counts", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(StockRoom(self.root).stock("PAPER")["quantity"], 12)
+
+    def test_cli_array_previews_read_real_ledger_independently(self):
+        payload = self.write_payload("previews.json", [
+            {"rows": self.rows()},
+            {"rows": self.rows()},
+        ])
+        result = self.run_cli("preview-counts", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        for batch in output:
+            self.assertEqual([(row["before"], row["difference"], row["after_shortage"]) for row in batch],
+                             [(12, -4, 2), (3, 0, 2)])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(self.app.counts("PAPER"), [])
+
+
 class ReversalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
