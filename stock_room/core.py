@@ -1206,7 +1206,11 @@ class StockRoom(JsonStore):
         record = {"supplier": supplier, "contact": contact, "phone": phone, "note": note}
         data = self._read()
         profiles = data.setdefault("suppliers", {})
+        before = self._supplier_snapshot(profiles, supplier)
         profiles[supplier] = record
+        self._record_supplier_change(
+            data, supplier, "save_supplier", None, before, self._supplier_snapshot(profiles, supplier)
+        )
         self._write(data)
         return dict(record)
 
@@ -1246,6 +1250,61 @@ class StockRoom(JsonStore):
         purchases.sort(key=lambda item: item["reference"])
         return {**record, "purchases": purchases}
 
+    def supplier_changes(self, supplier):
+        supplier = text(supplier, "supplier")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        changes = data.get("supplier_changes", {})
+        current = supplier in profiles or any(
+            order["supplier"] == supplier for order in data.get("purchases", [])
+        )
+        if not current and supplier not in changes:
+            raise ValueError("unknown supplier")
+        return [
+            {
+                "supplier": row["supplier"],
+                "sequence": row["sequence"],
+                "action": row["action"],
+                "related_supplier": row["related_supplier"],
+                "before": None if row["before"] is None else dict(row["before"]),
+                "after": None if row["after"] is None else dict(row["after"]),
+            }
+            for row in data.get("supplier_changes", {}).get(supplier, [])
+        ]
+
+    @staticmethod
+    def _supplier_snapshot(profiles, name):
+        # Normalized contact profile used for change snapshots; None means the
+        # supplier has no contact profile. Legacy profiles with missing fields
+        # default to empty strings.
+        profile = profiles.get(name)
+        if profile is None:
+            return None
+        return {
+            "supplier": name,
+            "contact": profile.get("contact", ""),
+            "phone": profile.get("phone", ""),
+            "note": profile.get("note", ""),
+        }
+
+    def _record_supplier_change(self, data, name, action, related, before, after):
+        # Append a change only when the normalized contact profile actually
+        # differs; repeat saves succeed without growing the history. The
+        # sequence is per supplier name and starts at 1; history stays under a
+        # name even after the profile is merged away. Snapshots are fresh dicts
+        # so later business can never rewrite a saved one.
+        if before == after:
+            return
+        records = data.setdefault("supplier_changes", {}).setdefault(name, [])
+        records.append({
+            "supplier": name,
+            "sequence": len(records) + 1,
+            "action": action,
+            "related_supplier": related,
+            "before": None if before is None else dict(before),
+            "after": None if after is None else dict(after),
+        })
+
     def merge_supplier(self, source, target):
         source = text(source, "source")
         target = text(target, "target")
@@ -1266,6 +1325,8 @@ class StockRoom(JsonStore):
             raise ValueError("unknown supplier")
         source_profile = profiles.get(source)
         target_profile = profiles.get(target)
+        source_before = self._supplier_snapshot(profiles, source)
+        target_before = self._supplier_snapshot(profiles, target)
         migrated = []
         for order in orders:
             if order["supplier"] == source:
@@ -1279,6 +1340,12 @@ class StockRoom(JsonStore):
                 merged[field] = target_value if target_value else source_value
             profiles[target] = merged
             profiles.pop(source, None)
+        self._record_supplier_change(
+            data, source, "merge_supplier", target, source_before, self._supplier_snapshot(profiles, source)
+        )
+        self._record_supplier_change(
+            data, target, "merge_supplier", source, target_before, self._supplier_snapshot(profiles, target)
+        )
         for before, order in migrated:
             self._record_purchase_change(data, order, "merge_supplier", before)
         self._write(data)
