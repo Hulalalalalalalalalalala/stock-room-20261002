@@ -5187,3 +5187,245 @@ class PurchaseChangeTests(unittest.TestCase):
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("error", json.loads(result.stderr))
+
+
+class AdjustPurchaseQuantitiesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.create_purchase("P1", "甲", [
+            {"code": "PAPER", "quantity": 10},
+            {"code": "BOX", "quantity": 5},
+        ])
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body), encoding="utf-8")
+        return str(payload)
+
+    def order(self, paper=10, box=5):
+        return {
+            "reference": "P1",
+            "supplier": "甲",
+            "status": "open",
+            "rows": [
+                {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": paper},
+                {"code": "BOX", "name": "纸箱", "unit": "个", "quantity": box},
+            ],
+        }
+
+    def test_partial_adjust_returns_full_order_and_preserves_everything_else(self):
+        result = self.app.adjust_purchase_quantities(" P1 ", [{"code": " PAPER ", "quantity": 8}])
+        self.assertEqual(result, self.order(paper=8))
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.purchase_order("P1"), self.order(paper=8))
+        # 库存、收退货记录与业务编号不受影响
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 0)
+        self.assertEqual(reopened.purchase_receipts("P1"), [])
+        self.assertEqual(reopened.purchase_returns("P1"), [])
+
+    def test_fixed_scenario_receive_return_adjust_then_atomic_failure(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        self.app.return_purchase("RCV1", 2, "RET1")
+        adjusted = self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        self.assertEqual(adjusted, self.order(paper=8))
+        progress = StockRoom(self.root).purchase_progress("P1")
+        paper = progress["rows"][0]
+        self.assertEqual((paper["quantity"], paper["received"], paper["returned"],
+                          paper["net_received"], paper["remaining"]), (8, 6, 2, 4, 2))
+        history = self.app.purchase_changes("P1")
+        self.assertEqual(len(history), 1)
+        before_bytes = self.app.path.read_bytes()
+        # 同次请求 BOX 调为三个、PAPER 调为五张：PAPER 低于累计收货六，整次失败
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [
+                {"code": "BOX", "quantity": 3},
+                {"code": "PAPER", "quantity": 5},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before_bytes)
+        self.assertEqual(self.app.purchase_order("P1"), self.order(paper=8))
+        self.assertEqual(self.app.purchase_changes("P1"), history)
+
+    def test_received_floor_ignores_returns_movements_counts_and_reversals(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        self.app.return_purchase("RCV1", 2, "RET1")
+        self.app.movement("PAPER", -3, "OUT-1")
+        self.app.count("PAPER", 1, "CNT-1")
+        self.app.reverse("OUT-1", "REV-1")
+        # 退货不恢复下限：累计收货六仍是下限
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 5}])
+        adjusted = self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 6}])
+        self.assertEqual(adjusted["rows"][0]["quantity"], 6)
+        # 未收货的 BOX 下限为零，可任意调整
+        self.assertEqual(self.app.adjust_purchase_quantities("P1", [{"code": "BOX", "quantity": 1}])["rows"][1]["quantity"], 1)
+
+    def test_unreceived_order_adjustable_and_missing_receipts_count_as_zero(self):
+        legacy = Path(self.temp.name) / "legacy"
+        legacy.mkdir()
+        payload = {
+            "materials": {"PAPER": {"code": "PAPER", "name": "包装纸", "unit": "张"}},
+            "purchases": [{
+                "reference": "L1", "supplier": "s", "status": "open",
+                "rows": [{"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 7}],
+            }],
+        }
+        (legacy / "data.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        app = StockRoom(legacy)
+        adjusted = app.adjust_purchase_quantities("L1", [{"code": "PAPER", "quantity": 3}])
+        self.assertEqual(adjusted["rows"][0]["quantity"], 3)
+        changes = StockRoom(legacy).purchase_changes("L1")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["sequence"], 1)
+        self.assertEqual(changes[0]["action"], "adjust_purchase_quantities")
+        self.assertEqual(changes[0]["before"]["rows"][0]["quantity"], 7)
+        self.assertEqual(changes[0]["after"]["rows"][0]["quantity"], 3)
+
+    def test_inactive_or_updated_material_does_not_block_adjustment(self):
+        self.app.set_active("BOX", False)
+        self.app.update_material("PAPER", "高级包装纸", "张")
+        result = self.app.adjust_purchase_quantities("P1", [
+            {"code": "PAPER", "quantity": 12},
+            {"code": "BOX", "quantity": 3},
+        ])
+        # 名称与单位快照保持原样
+        self.assertEqual(result, self.order(paper=12, box=3))
+        # 后续收货仍按既有状态与单位校验
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("P1", [{"code": "BOX", "quantity": 1, "reference": "RCV2"}])
+        received = self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 12, "reference": "RCV3"}])
+        self.assertEqual(received[0]["quantity"], 12)
+
+    def test_new_quantity_becomes_receipt_limit_after_reopen(self):
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 4}])
+        reopened = StockRoom(self.root)
+        with self.assertRaises(ValueError):
+            reopened.receive_purchase("P1", [{"code": "PAPER", "quantity": 5, "reference": "RCV1"}])
+        reopened.receive_purchase("P1", [{"code": "PAPER", "quantity": 4, "reference": "RCV1"}])
+        self.assertEqual(reopened.purchase_progress("P1")["rows"][0]["remaining"], 0)
+
+    def test_adjustment_visible_in_progress_list_supplier_csv_and_replenishment(self):
+        self.app.set_minimum("PAPER", 20)
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 15}])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.purchase_progress("P1")["rows"][0]["quantity"], 15)
+        listed = reopened.purchase_orders(supplier="甲")
+        self.assertEqual(listed[0]["rows"][0]["quantity"], 15)
+        record = reopened.supplier_record("甲")
+        self.assertEqual(record["purchases"][0]["rows"][0]["quantity"], 15)
+        exported = reopened.export_purchases_csv()
+        self.assertIn("P1,甲,open,pending,PAPER,包装纸,张,15,0,0,0,15", exported)
+        plan = reopened.replenishment_plan()
+        self.assertEqual(plan[0]["incoming"], 15)
+        self.assertEqual(plan[0]["purchases"][0]["remaining"], 15)
+
+    def test_repeat_submission_succeeds_without_write_or_history(self):
+        first = self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        before = self.app.path.read_bytes()
+        again = self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        self.assertEqual(again, first)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        changes = self.app.purchase_changes("P1")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["action"], "adjust_purchase_quantities")
+        self.assertEqual(changes[0]["before"], self.order())
+        self.assertEqual(changes[0]["after"], self.order(paper=8))
+
+    def test_history_shares_sequence_and_full_snapshots_with_other_actions(self):
+        self.app.adjust_purchase_quantities("P1", [{"code": "BOX", "quantity": 9}])
+        self.app.cancel_purchase("P1")
+        changes = StockRoom(self.root).purchase_changes("P1")
+        self.assertEqual([c["sequence"] for c in changes], [1, 2])
+        self.assertEqual([c["action"] for c in changes], ["adjust_purchase_quantities", "cancel_purchase"])
+        self.assertEqual(changes[0]["before"], self.order())
+        self.assertEqual(changes[0]["after"], self.order(box=9))
+        self.assertEqual(changes[1]["before"], changes[0]["after"])
+        self.assertEqual(changes[1]["after"]["status"], "cancelled")
+        self.assertEqual(changes[1]["after"]["rows"], self.order(box=9)["rows"])
+
+    def test_validation_failures_preserve_file_bytes(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        before = self.app.path.read_bytes()
+        bad_calls = [
+            ("", [{"code": "PAPER", "quantity": 8}]),
+            ("   ", [{"code": "PAPER", "quantity": 8}]),
+            (11, [{"code": "PAPER", "quantity": 8}]),
+            (None, [{"code": "PAPER", "quantity": 8}]),
+            ("UNKNOWN", [{"code": "PAPER", "quantity": 8}]),
+            ("p1", [{"code": "PAPER", "quantity": 8}]),
+            ("P1", []),
+            ("P1", "PAPER"),
+            ("P1", None),
+            ("P1", ["PAPER"]),
+            ("P1", [{"code": "PAPER"}]),
+            ("P1", [{"quantity": 8}]),
+            ("P1", [{"code": "PAPER", "quantity": 8, "name": "x"}]),
+            ("P1", [{"code": "  ", "quantity": 8}]),
+            ("P1", [{"code": 11, "quantity": 8}]),
+            ("P1", [{"code": "GHOST", "quantity": 8}]),
+            ("P1", [{"code": "PAPER", "quantity": True}]),
+            ("P1", [{"code": "PAPER", "quantity": 0}]),
+            ("P1", [{"code": "PAPER", "quantity": -1}]),
+            ("P1", [{"code": "PAPER", "quantity": 1.5}]),
+            ("P1", [{"code": "PAPER", "quantity": "8"}]),
+            ("P1", [{"code": "PAPER", "quantity": 8}, {"code": " PAPER ", "quantity": 9}]),
+            ("P1", [{"code": "PAPER", "quantity": 5}]),
+        ]
+        for reference, rows in bad_calls:
+            with self.subTest(reference=reference, rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.adjust_purchase_quantities(reference, rows)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.purchase_changes("P1"), [])
+
+    def test_cancelled_purchase_rejected(self):
+        self.app.cancel_purchase("P1")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_failure_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_adjustment_does_not_change_stock_or_records(self):
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV1"}])
+        self.app.return_purchase("RCV1", 2, "RET1")
+        movements_before = self.app.history("PAPER")
+        stock_before = self.app.stock("PAPER")["quantity"]
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], stock_before)
+        self.assertEqual(reopened.history("PAPER"), movements_before)
+        self.assertEqual(len(reopened.purchase_receipts("P1")), 1)
+        self.assertEqual(len(reopened.purchase_returns("P1")), 1)
+
+    def test_cli_success_failure_and_idempotent_repeat(self):
+        payload = self.write_payload("adjust.json", {
+            "reference": "P1", "rows": [{"code": "PAPER", "quantity": 8}, {"code": "BOX", "quantity": 3}],
+        })
+        result = self.run_cli("adjust-purchase-quantities", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), self.order(paper=8, box=3))
+        before = self.app.path.read_bytes()
+        result = self.run_cli("adjust-purchase-quantities", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(StockRoom(self.root).purchase_changes("P1")), 1)
+        bad = self.write_payload("bad-adjust.json", {"reference": "P1", "rows": [{"code": "PAPER", "quantity": 0}]})
+        result = self.run_cli("adjust-purchase-quantities", bad)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)

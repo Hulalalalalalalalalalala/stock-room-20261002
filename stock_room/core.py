@@ -724,6 +724,44 @@ class StockRoom(JsonStore):
         self._write(data)
         return self._purchase_snapshot(order)
 
+    def adjust_purchase_quantities(self, reference, rows):
+        reference = text(reference, "reference")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        order = next((row for row in data.get("purchases", []) if row["reference"] == reference), None)
+        if order is None:
+            raise ValueError("unknown purchase reference")
+        if order["status"] == "cancelled":
+            raise ValueError("purchase is cancelled")
+        received = self._received_totals(data, reference)
+        lines = {row["code"]: row for row in order["rows"]}
+        seen = set()
+        planned = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "quantity"}:
+                raise ValueError("each row must be an object with code and quantity")
+            code = text(entry["code"], "code")
+            quantity = entry["quantity"]
+            if type(quantity) is not int or quantity <= 0:
+                raise ValueError("quantity must be a positive integer")
+            if code not in lines:
+                raise ValueError("material is not part of the purchase")
+            if code in seen:
+                raise ValueError("material already exists in purchase")
+            seen.add(code)
+            if quantity < received.get(code, 0):
+                raise ValueError("quantity is below the received quantity")
+            planned.append((code, quantity))
+        before = self._purchase_snapshot(order)
+        for code, quantity in planned:
+            lines[code]["quantity"] = quantity
+        after = self._purchase_snapshot(order)
+        if after != before:
+            self._record_purchase_change(data, order, "adjust_purchase_quantities", before)
+            self._write(data)
+        return after
+
     def receive_purchase(self, purchase_reference, rows):
         purchase_reference = text(purchase_reference, "purchase_reference")
         if not isinstance(rows, list) or not rows:
