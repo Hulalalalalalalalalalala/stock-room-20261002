@@ -475,12 +475,23 @@ class StockRoom(JsonStore):
         self._write(data)
         return [dict(record) for record in records]
 
+    def preview_reversals(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        planned = self._plan_reversals(data, rows)
+        return [
+            {key: row[key] for key in ("code", "original_reference", "reference", "quantity", "before", "balance")}
+            for row in planned
+        ]
+
     def _plan_reversals(self, data, rows):
-        # Shared batch reversal rules: each row is validated in input order
-        # against the pre-batch ledger (new reversals never act as originals
-        # within the same batch), the reference namespace and the running
-        # per-material balance. Nothing is written here; the caller commits
-        # the whole plan atomically.
+        # Shared batch reversal rules for the commit and preview paths: each
+        # row is validated in input order against the pre-batch ledger (new
+        # reversals never act as originals within the same batch), the
+        # reference namespace and the running per-material balance. Nothing
+        # is written here; callers decide whether to commit the plan or just
+        # report it.
         counts = data.get("counts", [])
         reversals = data.get("reversals", [])
         movements = data.get("movements", [])
@@ -523,7 +534,8 @@ class StockRoom(JsonStore):
             quantity = -original["quantity"]
             if code not in balances:
                 balances[code] = sum(row["quantity"] for row in movements if row["code"] == code)
-            balances[code] += quantity
+            before = balances[code]
+            balances[code] = before + quantity
             if balances[code] < 0:
                 raise ValueError("insufficient stock")
             seen_originals.add(original_reference)
@@ -533,6 +545,7 @@ class StockRoom(JsonStore):
                 "original_reference": original_reference,
                 "reference": reference,
                 "quantity": quantity,
+                "before": before,
                 "balance": balances[code],
             })
         return planned

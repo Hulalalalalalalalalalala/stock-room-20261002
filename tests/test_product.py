@@ -484,6 +484,284 @@ class ReverseBatchTests(unittest.TestCase):
         self.assertEqual([row["reference"] for row in self.app.reversals("PAPER")], ["REV-OUT", "REV-IN"])
 
 
+class PreviewReversalsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-001")
+        self.app.movement("PAPER", -6, "OUT-001")
+        self.app.movement("BOX", 3, "BIN")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def rows(self):
+        return [
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ]
+
+    def test_preview_fields_order_and_running_balances(self):
+        result = self.app.preview_reversals(self.rows())
+        self.assertEqual(result, [
+            {"code": "PAPER", "original_reference": "OUT-001", "reference": "REV-OUT",
+             "quantity": 6, "before": 14, "balance": 20},
+            {"code": "PAPER", "original_reference": "IN-001", "reference": "REV-IN",
+             "quantity": -20, "before": 20, "balance": 0},
+        ])
+        self.assertEqual([set(row) for row in result], [
+            {"code", "original_reference", "reference", "quantity", "before", "balance"},
+            {"code", "original_reference", "reference", "quantity", "before", "balance"},
+        ])
+        self.assertEqual(len(result), len(self.rows()))
+        # Preview leaves stock and history untouched.
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual([(row["quantity"], row["reference"]) for row in self.app.history("PAPER")],
+                         [(20, "IN-001"), (-6, "OUT-001")])
+
+    def test_preview_spans_materials(self):
+        result = self.app.preview_reversals([
+            {"original_reference": "BIN", "reference": "REV-BIN"},
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+        ])
+        self.assertEqual([(row["code"], row["before"], row["balance"]) for row in result],
+                         [("BOX", 3, 0), ("PAPER", 14, 20)])
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_preview_allows_inactive_material(self):
+        self.app.set_active("PAPER", False)
+        result = self.app.preview_reversals(self.rows())
+        self.assertEqual([row["balance"] for row in result], [20, 0])
+        self.assertEqual(self.app.material_status("PAPER")["active"], False)
+
+    def test_swapped_order_raises_and_returns_nothing(self):
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            ])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        # Failed request's references are reusable.
+        result = self.app.preview_reversals([{"original_reference": "OUT-001", "reference": "REV-IN"}])
+        self.assertEqual((result[0]["before"], result[0]["balance"]), (14, 20))
+
+    def test_preview_changes_nothing_keeps_input_and_reopens(self):
+        before = self.app.path.read_bytes()
+        rows = [
+            {"original_reference": "  OUT-001  ", "reference": "  REV OUT  "},
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+        ]
+        snapshot = json.loads(json.dumps(rows))
+        result = self.app.preview_reversals(rows)
+        self.assertEqual(rows, snapshot)
+        self.assertEqual((result[0]["original_reference"], result[0]["reference"]), ("OUT-001", "REV OUT"))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual([row["reference"] for row in self.app.history("PAPER")], ["IN-001", "OUT-001"])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 14)
+        self.assertEqual(reopened.reversals("PAPER"), [])
+        self.assertEqual([row["reference"] for row in reopened.history("PAPER")], ["IN-001", "OUT-001"])
+
+    def test_failed_preview_does_not_create_missing_file(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        for rows in ([], None, "rows", 1, [None], ["x"], [{}],
+                     [{"original_reference": "X", "reference": "Y"}]):
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    app.preview_reversals(rows)
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_repeated_preview_is_identical(self):
+        first = self.app.preview_reversals(self.rows())
+        second = self.app.preview_reversals(json.loads(json.dumps(self.rows())))
+        self.assertEqual(first, second)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_preview_then_commit_matches_without_before(self):
+        preview = self.app.preview_reversals(self.rows())
+        committed = self.app.reverse_batch(self.rows())
+        self.assertEqual(len(preview), len(committed))
+        for previewed, actual in zip(preview, committed):
+            self.assertEqual(set(actual), {"code", "original_reference", "reference", "quantity", "balance"})
+            self.assertEqual({key: value for key, value in previewed.items() if key != "before"}, actual)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 0)
+        self.assertEqual([row["reference"] for row in reopened.reversals("PAPER")], ["REV-OUT", "REV-IN"])
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("PAPER")],
+                         [(20, "IN-001"), (-6, "OUT-001"), (6, "REV-OUT"), (-20, "REV-IN")])
+
+    def test_business_change_between_preview_and_commit_uses_latest_ledger(self):
+        preview = self.app.preview_reversals(self.rows())
+        self.assertEqual([(row["before"], row["balance"]) for row in preview], [(14, 20), (20, 0)])
+        self.app.movement("PAPER", 2, "IN-002")
+        committed = self.app.reverse_batch(self.rows())
+        self.assertEqual([(row["balance"]) for row in committed], [22, 2])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 2)
+
+    def test_identifiers_stripped_internal_whitespace_kept_and_case_sensitive(self):
+        result = self.app.preview_reversals([
+            {"original_reference": "  OUT-001  ", "reference": "  REV A  "},
+        ])
+        self.assertEqual((result[0]["original_reference"], result[0]["reference"]), ("OUT-001", "REV A"))
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([{"original_reference": "out-001", "reference": "LOWER"}])
+        # A committed reference is matched exactly and case-sensitively.
+        self.app.reverse("OUT-001", "REV OUT")
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([{"original_reference": "IN-001", "reference": "REV OUT"}])
+        different_case = self.app.preview_reversals([
+            {"original_reference": "IN-001", "reference": "rev out"},
+        ])
+        self.assertEqual(different_case[0]["reference"], "rev out")
+
+    def test_invalid_rows_shape_and_values_rejected(self):
+        bad_rows = [
+            [], None, "rows", 5, ["not-an-object"], [None], [{}],
+            [{"original_reference": "OUT-001"}],
+            [{"reference": "REV-OUT"}],
+            [{"original_reference": "OUT-001", "reference": "REV-OUT", "extra": 1}],
+        ]
+        for rows in bad_rows:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.preview_reversals(rows)
+        for value in ("", "   ", 7, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.app.preview_reversals([{"original_reference": value, "reference": "R"}])
+                with self.assertRaises(ValueError):
+                    self.app.preview_reversals([{"original_reference": "OUT-001", "reference": value}])
+
+    def test_invalid_originals_and_duplicates_rejected(self):
+        self.app.count("PAPER", 14, "CNT-ZERO")
+        self.app.count("PAPER", 10, "CNT-001")
+        cases = [
+            [{"original_reference": "MISSING", "reference": "R1"}],
+            [{"original_reference": "CNT-ZERO", "reference": "R1"}],
+            [{"original_reference": "CNT-001", "reference": "R1"}],
+            [
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+                {"original_reference": "REV-OUT", "reference": "R2"},
+            ],
+            [
+                {"original_reference": "OUT-001", "reference": "A"},
+                {"original_reference": "OUT-001", "reference": "B"},
+            ],
+            [{"original_reference": "IN-001", "reference": "IN-001"}],
+            [{"original_reference": "IN-001", "reference": "CNT-ZERO"}],
+            [
+                {"original_reference": "IN-001", "reference": "DUP"},
+                {"original_reference": "BIN", "reference": "DUP"},
+            ],
+        ]
+        for rows in cases:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.preview_reversals(rows)
+        self.app.reverse("OUT-001", "REV-OUT")
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([{"original_reference": "OUT-001", "reference": "R3"}])
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([{"original_reference": "REV-OUT", "reference": "R4"}])
+        self.assertEqual([row["reference"] for row in self.app.reversals("PAPER")], ["REV-OUT"])
+        # The count set PAPER to 10 before the single reversal returned +6.
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 16)
+
+    def test_purchase_originals_rejected_and_purchase_namespace_independent(self):
+        self.app.register("TAPE", "胶带", "卷")
+        self.app.create_purchase("PO-1", "supplier", [{"code": "TAPE", "quantity": 5}])
+        self.app.receive_purchase("PO-1", [{"code": "TAPE", "quantity": 5, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 2, "RET-1")
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([{"original_reference": "RCV-1", "reference": "RR"}])
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([{"original_reference": "RET-1", "reference": "RR2"}])
+        result = self.app.preview_reversals([{"original_reference": "OUT-001", "reference": "PO-1"}])
+        self.assertEqual(result[0]["reference"], "PO-1")
+
+    def test_hypothetical_batch_reversals_cannot_serve_as_originals(self):
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+                {"original_reference": "REV-OUT", "reference": "REV-REV"},
+            ])
+        self.assertEqual(self.app.reversals("PAPER"), [])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+
+    def test_rejected_preview_keeps_file_bytes(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.preview_reversals([
+                {"original_reference": "IN-001", "reference": "REV-IN"},
+                {"original_reference": "OUT-001", "reference": "REV-OUT"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+    def test_legacy_data_without_associations_treats_them_as_absent(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({
+            "materials": {"PAPER": {"code": "PAPER", "name": "包装纸", "unit": "张"}},
+            "movements": [
+                {"code": "PAPER", "quantity": 5, "reference": "PLAIN-IN"},
+                {"code": "PAPER", "quantity": 3, "reference": "LOOKS-LIKE-RECEIPT"},
+            ],
+        }), encoding="utf-8")
+        app = StockRoom(legacy)
+        result = app.preview_reversals([
+            {"original_reference": "PLAIN-IN", "reference": "REV-1"},
+            {"original_reference": "LOOKS-LIKE-RECEIPT", "reference": "REV-2"},
+        ])
+        self.assertEqual([(row["before"], row["quantity"], row["balance"]) for row in result],
+                         [(8, -5, 3), (3, -3, 0)])
+
+    def test_cli_preview_success_failure_and_array_independence(self):
+        payload = self.write_payload("preview.json", {"rows": self.rows()})
+        result = self.run_cli("preview-reversals", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual([(row["before"], row["balance"]) for row in output], [(14, 20), (20, 0)])
+        # Failure: error JSON on stderr, exit code 2, ledger untouched.
+        bad = self.write_payload("bad.json", {"rows": [
+            {"original_reference": "IN-001", "reference": "REV-IN"},
+            {"original_reference": "OUT-001", "reference": "REV-OUT"},
+        ]})
+        failed = self.run_cli("preview-reversals", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        # JSON array: every preview reads the real ledger instead of chaining.
+        batch = self.write_payload("previews.json", [
+            {"rows": [{"original_reference": "OUT-001", "reference": "REV-OUT"}]},
+            {"rows": [{"original_reference": "OUT-001", "reference": "REV-OUT"}]},
+        ])
+        repeated = self.run_cli("preview-reversals", batch)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        groups = json.loads(repeated.stdout)
+        self.assertEqual([group[0]["before"] for group in groups], [14, 14])
+        self.assertEqual([group[0]["balance"] for group in groups], [20, 20])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.reversals("PAPER"), [])
+
+
 class MinimumStockTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
