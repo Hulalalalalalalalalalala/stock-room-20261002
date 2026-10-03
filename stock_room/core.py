@@ -224,12 +224,31 @@ class StockRoom(JsonStore):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
         data = self._read()
+        planned = self._plan_movements(data, rows)
+        data.setdefault("movements", []).extend(
+            {"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]} for row in planned
+        )
+        self._write(data)
+        return [{key: row[key] for key in ("code", "quantity", "reference", "balance")} for row in planned]
+
+    def preview_movements(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        return self._plan_movements(data, rows)
+
+    def _plan_movements(self, data, rows):
+        # Shared batch movement rules for the commit and preview paths: each
+        # row is validated in input order against the material registry, the
+        # reference namespace and the running per-material balance. Nothing
+        # is written here; callers decide whether to commit the plan or just
+        # report it.
         materials = data.get("materials", {})
         status = data.get("status", {})
         existing = data.get("movements", [])
         balances = {}
         seen = set()
-        parsed = []
+        planned = []
         for entry in rows:
             if not isinstance(entry, dict) or set(entry) != {"code", "quantity", "reference"}:
                 raise ValueError("each row must be an object with code, quantity and reference")
@@ -247,16 +266,13 @@ class StockRoom(JsonStore):
             self._require_unique_reference(data, reference)
             if code not in balances:
                 balances[code] = sum(row["quantity"] for row in existing if row["code"] == code)
-            balances[code] += quantity
+            before = balances[code]
+            balances[code] = before + quantity
             if balances[code] < 0:
                 raise ValueError("insufficient stock")
             seen.add(reference)
-            parsed.append({"code": code, "quantity": quantity, "reference": reference, "balance": balances[code]})
-        data.setdefault("movements", []).extend(
-            {"code": row["code"], "quantity": row["quantity"], "reference": row["reference"]} for row in parsed
-        )
-        self._write(data)
-        return parsed
+            planned.append({"code": code, "quantity": quantity, "reference": reference, "before": before, "balance": balances[code]})
+        return planned
 
     def stock(self, code):
         data = self._read()
