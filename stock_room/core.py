@@ -1599,6 +1599,62 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def stock_summary(self, start_reference=None, end_reference=None, keyword=""):
+        if not isinstance(keyword, str):
+            raise ValueError("keyword must be a string")
+        keyword = keyword.strip()
+        data = self._read()
+        movements = data.get("movements", [])
+        if movements:
+            start = self._summary_boundary(start_reference, movements, "start_reference", 0)
+            end = self._summary_boundary(end_reference, movements, "end_reference", len(movements) - 1)
+            if start > end:
+                raise ValueError("start_reference is after end_reference")
+            before = movements[:start]
+            window = movements[start:end + 1]
+        else:
+            # An empty ledger has no references to locate; explicit bounds
+            # are therefore always invalid, while the default full range
+            # simply reports zeros for every material.
+            if start_reference is not None:
+                self._summary_boundary(start_reference, movements, "start_reference", 0)
+            if end_reference is not None:
+                self._summary_boundary(end_reference, movements, "end_reference", 0)
+            before = []
+            window = []
+        items = []
+        for code, material in data.get("materials", {}).items():
+            if keyword and keyword not in code and keyword not in material["name"]:
+                continue
+            opening = sum(row["quantity"] for row in before if row["code"] == code)
+            incoming = sum(row["quantity"] for row in window if row["code"] == code and row["quantity"] > 0)
+            outgoing = sum(-row["quantity"] for row in window if row["code"] == code and row["quantity"] < 0)
+            items.append({
+                "code": code,
+                "name": material["name"],
+                "unit": material["unit"],
+                "opening": opening,
+                "incoming": incoming,
+                "outgoing": outgoing,
+                "closing": opening + incoming - outgoing,
+            })
+        items.sort(key=lambda item: item["code"])
+        return items
+
+    @staticmethod
+    def _summary_boundary(value, movements, label, default):
+        # A null bound falls back to the ledger edge; any other value must
+        # be a nonempty string (after trimming) naming exactly one movement
+        # in registration order. References are unique across the ledger,
+        # so the first match is the only match.
+        if value is None:
+            return default
+        reference = text(value, label)
+        for index, row in enumerate(movements):
+            if row["reference"] == reference:
+                return index
+        raise ValueError(label + " is not a movement reference")
+
     def export_inventory_csv(self, keyword="", active=None):
         items = self.inventory(keyword=keyword, active=active)
         lines = ["code,name,unit,quantity,minimum,active"]

@@ -6303,3 +6303,115 @@ class SupplierOutstandingTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
+
+
+class StockSummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+
+    def seed_ledger(self):
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 20, "IN-1")
+        self.app.movement("BOX", 5, "IN-2")
+        self.app.movement("PAPER", -6, "OUT-1")
+        self.app.count("PAPER", 12, "CNT-1")
+        self.app.reverse("OUT-1", "REV-1")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def test_interval_summary_and_reopen(self):
+        self.seed_ledger()
+        expected = [
+            {"code": "BOX", "name": "纸箱", "unit": "个", "opening": 0, "incoming": 5, "outgoing": 0, "closing": 5},
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "opening": 20, "incoming": 0, "outgoing": 8, "closing": 12},
+        ]
+        self.assertEqual(self.app.stock_summary("IN-2", "CNT-1"), expected)
+        self.assertEqual(StockRoom(self.root).stock_summary("IN-2", "CNT-1"), expected)
+
+    def test_default_full_range(self):
+        self.seed_ledger()
+        result = self.app.stock_summary()
+        by_code = {item["code"]: item for item in result}
+        self.assertEqual(by_code["PAPER"]["closing"], 18)
+        self.assertEqual((by_code["PAPER"]["opening"], by_code["PAPER"]["incoming"],
+                          by_code["PAPER"]["outgoing"]), (0, 26, 8))
+        self.assertEqual(by_code["BOX"]["closing"], 5)
+
+    def test_keyword_filter_and_inactive_kept(self):
+        self.seed_ledger()
+        self.app.set_active("BOX", False)
+        result = self.app.stock_summary(keyword="纸")
+        self.assertEqual([item["code"] for item in result], ["BOX", "PAPER"])
+        self.assertEqual(self.app.stock_summary(keyword="纸箱")[0]["code"], "BOX")
+        self.assertEqual(self.app.stock_summary(keyword="无匹配"), [])
+
+    def test_empty_ledger_defaults_report_zeros(self):
+        self.app.register("PAPER", "包装纸", "张")
+        self.assertEqual(self.app.stock_summary(), [
+            {"code": "PAPER", "name": "包装纸", "unit": "张",
+             "opening": 0, "incoming": 0, "outgoing": 0, "closing": 0},
+        ])
+
+    def test_invalid_arguments_raise_and_preserve_bytes(self):
+        self.seed_ledger()
+        before = self.app.path.read_bytes()
+        for arguments in (
+            {"start_reference": 1},
+            {"end_reference": "  "},
+            {"start_reference": "不存在"},
+            {"start_reference": "CNT-1", "end_reference": "IN-2"},
+            {"keyword": 1},
+        ):
+            with self.assertRaises(ValueError):
+                self.app.stock_summary(**arguments)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_validation_runs_without_matches(self):
+        self.seed_ledger()
+        with self.assertRaises(ValueError):
+            self.app.stock_summary("不存在", keyword="无匹配")
+        with self.assertRaises(ValueError):
+            self.app.stock_summary(keyword=2)
+
+    def test_success_and_failure_preserve_file_and_missing_file(self):
+        self.seed_ledger()
+        before = self.app.path.read_bytes()
+        self.app.stock_summary("IN-2", "CNT-1")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        missing = StockRoom(self.root / "empty")
+        self.assertEqual(missing.stock_summary(), [])
+        self.assertFalse((self.root / "empty" / "data.json").exists())
+
+    def test_legacy_data_without_movements(self):
+        self.app.register("PAPER", "包装纸", "张")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("movements", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = StockRoom(self.root).stock_summary()
+        self.assertEqual(result[0]["closing"], 0)
+
+    def test_cli_success_and_failure(self):
+        self.seed_ledger()
+        payload = self.write_payload("summary.json", {"start_reference": "IN-2", "end_reference": "CNT-1"})
+        before = self.app.path.read_bytes()
+        result = self.run_cli("stock-summary", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual({item["code"]: item["closing"] for item in value}, {"BOX": 5, "PAPER": 12})
+        self.assertEqual(self.app.path.read_bytes(), before)
+        bad = self.write_payload("summary-bad.json", {"start_reference": "不存在"})
+        failed = self.run_cli("stock-summary", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
