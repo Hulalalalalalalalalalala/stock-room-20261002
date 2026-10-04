@@ -3158,6 +3158,217 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual(StockRoom(self.root).purchase_order("PO-1")["status"], "open")
 
 
+class ReplenishmentPurchaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.set_minimum("PAPER", 10)
+        self.app.set_minimum("BOX", 5)
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 7}])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 1, "RET-1")
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 5}])
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body), encoding="utf-8")
+        return str(payload)
+
+    def test_fixed_sample_mixed_selection_fails_single_succeeds(self):
+        # PAPER: 库存 2（收 3 退 1），在途 4（订 7 收 3，退货不恢复未收量），建议 4。
+        # BOX: 库存 0，在途 5，建议 0，因此混合选择整次失败。
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.create_replenishment_purchase("PO-3", "新供应商", ["PAPER", "BOX"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.purchase_order("PO-3")
+
+        order = self.app.create_replenishment_purchase("PO-3", " 新 供应商 ", ["PAPER"])
+        self.assertEqual(order, {
+            "reference": "PO-3",
+            "supplier": "新 供应商",
+            "status": "open",
+            "rows": [{"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 4}],
+        })
+
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 2)
+        self.assertEqual(reopened.purchase_order("PO-3"), order)
+        plan = {item["code"]: item for item in reopened.replenishment_plan()}
+        self.assertEqual(plan["PAPER"]["incoming"], 8)
+        self.assertEqual(plan["PAPER"]["suggested"], 0)
+        self.assertEqual(
+            [(item["reference"], item["remaining"]) for item in plan["PAPER"]["purchases"]],
+            [("PO-1", 4), ("PO-3", 4)],
+        )
+        # 新单按既有规则收货。
+        received = reopened.receive_purchase("PO-3", [{"code": "PAPER", "quantity": 4, "reference": "RCV-2"}])
+        self.assertEqual(received[0]["balance"], 6)
+
+    def test_rows_follow_codes_order_and_snapshot_current_profile(self):
+        self.app.register("INK", "油墨", "瓶")
+        self.app.set_minimum("INK", 3)
+        order = self.app.create_replenishment_purchase("PO-3", "供应商", ["INK", "PAPER"])
+        self.assertEqual([row["code"] for row in order["rows"]], ["INK", "PAPER"])
+        self.assertEqual(order["rows"][0], {"code": "INK", "name": "油墨", "unit": "瓶", "quantity": 3})
+        self.assertEqual(order["rows"][1]["quantity"], 4)
+        # 名称与单位为下单时快照，后续修改物料资料不影响单据。
+        self.app.update_material("INK", "高级油墨", "桶")
+        saved = self.app.purchase_order("PO-3")
+        self.assertEqual(saved["rows"][0]["name"], "油墨")
+        self.assertEqual(saved["rows"][0]["unit"], "瓶")
+
+    def test_cancelled_and_fully_received_lines_do_not_count(self):
+        self.app.cancel_purchase("PO-2")
+        order = self.app.create_replenishment_purchase("PO-3", "供应商", ["BOX"])
+        self.assertEqual(order["rows"][0]["quantity"], 5)
+        self.app.receive_purchase("PO-3", [{"code": "BOX", "quantity": 5, "reference": "RCV-2"}])
+        self.app.set_minimum("PAPER", 2)
+        # PAPER 建议量降为零（最低库存 2，库存 2），BOX 在途已收齐。
+        with self.assertRaises(ValueError):
+            self.app.create_replenishment_purchase("PO-4", "供应商", ["PAPER", "BOX"])
+
+    def test_validation_failures_preserve_file(self):
+        before = self.app.path.read_bytes()
+        bad = [
+            {"reference": "PO-9", "supplier": "供应商", "codes": []},
+            {"reference": "PO-9", "supplier": "供应商", "codes": "PAPER"},
+            {"reference": "PO-9", "supplier": "供应商", "codes": {"code": "PAPER"}},
+            {"reference": "PO-9", "supplier": "供应商", "codes": ["PAPER", " PAPER "]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": ["UNKNOWN"]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": [""]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": ["  "]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": [1]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": [None]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": [True]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": [{"code": "PAPER"}]},
+            {"reference": "PO-9", "supplier": "供应商", "codes": ["BOX"]},
+            {"reference": "", "supplier": "供应商", "codes": ["PAPER"]},
+            {"reference": "  ", "supplier": "供应商", "codes": ["PAPER"]},
+            {"reference": 1, "supplier": "供应商", "codes": ["PAPER"]},
+            {"reference": "PO-9", "supplier": "", "codes": ["PAPER"]},
+            {"reference": "PO-9", "supplier": "  ", "codes": ["PAPER"]},
+            {"reference": "PO-9", "supplier": 1, "codes": ["PAPER"]},
+            {"reference": "PO-1", "supplier": "供应商", "codes": ["PAPER"]},
+            {"reference": " PO-1 ", "supplier": "供应商", "codes": ["PAPER"]},
+        ]
+        for body in bad:
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    self.app.create_replenishment_purchase(**body)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.purchase_order("PO-9")
+
+    def test_inactive_material_rejected(self):
+        self.app.set_active("PAPER", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.create_replenishment_purchase("PO-9", "供应商", ["PAPER"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_unit_mismatch_checked_only_for_selected_materials(self):
+        self.app.register("INK", "油墨", "瓶")
+        self.app.set_minimum("INK", 3)
+        self.app.create_purchase("PO-8", "供应商", [{"code": "INK", "quantity": 2}])
+        self.app.update_material("INK", "油墨", "桶")
+        # INK 的在途单位与当前单位不一致，但不影响只为 PAPER 下单。
+        order = self.app.create_replenishment_purchase("PO-9", "供应商", ["PAPER"])
+        self.assertEqual(order["rows"][0]["quantity"], 4)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.create_replenishment_purchase("PO-10", "供应商", ["INK"])
+        with self.assertRaises(ValueError):
+            self.app.create_replenishment_purchase("PO-10", "供应商", ["PAPER", "INK"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_reference_unique_only_among_purchases(self):
+        order = self.app.create_replenishment_purchase("RCV-1", "供应商", ["PAPER"])
+        self.assertEqual(order["reference"], "RCV-1")
+        with self.assertRaises(ValueError):
+            self.app.create_replenishment_purchase("RCV-1", "供应商", ["PAPER"])
+        moved = self.app.movement("PAPER", 1, "PO-1")
+        self.assertEqual(moved["balance"], 3)
+
+    def test_creation_keeps_stock_suppliers_and_history_unchanged(self):
+        before_movements = self.app.history("PAPER")
+        self.app.create_replenishment_purchase("PO-9", "新供应商", ["PAPER"])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 2)
+        self.assertEqual(self.app.history("PAPER"), before_movements)
+        self.assertEqual(self.app.inventory()[0]["minimum"], 5)
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("新供应商", data.get("suppliers", {}))
+        self.assertEqual(self.app.supplier_changes("新供应商"), [])
+        self.assertEqual(self.app.purchase_changes("PO-9"), [])
+
+    def test_failure_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.create_replenishment_purchase("PO-1", "供应商", ["PAPER"])
+        with self.assertRaises(ValueError):
+            app.create_replenishment_purchase("PO-1", "供应商", [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_defaults_apply(self):
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("status", None)
+        data.pop("purchase_receipts", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        # 缺少收货记录时在途按订购量全额计算：PAPER 库存 2、在途 7，建议 1。
+        order = reopened.create_replenishment_purchase("PO-9", "供应商", ["PAPER"])
+        self.assertEqual(order["rows"][0]["quantity"], 1)
+        # 旧数据缺少最低库存时按零，建议量为零则拒绝。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("minimums", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).create_replenishment_purchase("PO-10", "供应商", ["PAPER"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_success_failure_and_array_partial_success(self):
+        payload = self.write_payload("replen.json", {
+            "reference": "PO-3", "supplier": "供应商", "codes": ["PAPER"],
+        })
+        result = self.run_cli("create-replenishment-purchase", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        created = json.loads(result.stdout)
+        self.assertEqual(created["status"], "open")
+        self.assertEqual(created["rows"], [{"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 4}])
+
+        before = self.app.path.read_bytes()
+        bad = self.write_payload("bad.json", {"reference": "PO-4", "supplier": "供应商", "codes": ["BOX"]})
+        result = self.run_cli("create-replenishment-purchase", bad)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+        array = self.write_payload("array.json", [
+            {"reference": "PO-5", "supplier": "供应商", "codes": ["INK"]},
+            {"reference": "PO-6", "supplier": "供应商", "codes": ["UNKNOWN"]},
+        ])
+        self.app.register("INK", "油墨", "瓶")
+        self.app.set_minimum("INK", 3)
+        result = self.run_cli("create-replenishment-purchase", array)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(StockRoom(self.root).purchase_order("PO-5")["rows"],
+                         [{"code": "INK", "name": "油墨", "unit": "瓶", "quantity": 3}])
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).purchase_order("PO-6")
+
+
 class PurchaseReceiptTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
