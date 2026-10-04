@@ -6123,3 +6123,183 @@ class ImportSuppliersCsvTests(unittest.TestCase):
         reopened = StockRoom(self.root)
         self.assertEqual(reopened.supplier_record("新商")["phone"], "005")
         self.assertEqual(reopened.supplier_record("北辰")["phone"], "001")
+
+
+class SupplierOutstandingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        self.app.create_purchase("P1", "北辰", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 2, "RET-1")
+        self.app.create_purchase("P2", "北辰", [{"code": "PAPER", "quantity": 3}])
+        self.app.create_purchase("P3", "北辰", [{"code": "PAPER", "quantity": 20}])
+        self.app.cancel_purchase("P3")
+        self.app.create_purchase("P4", "北辰包装", [{"code": "PAPER", "quantity": 100}])
+
+    def test_fixed_sample_return_does_not_restore_and_cancelled_excluded(self):
+        self.seed_fixed_sample()
+        result = StockRoom(self.root).supplier_outstanding("  北辰  ")
+        self.assertEqual(result, [{
+            "code": "PAPER",
+            "unit": "张",
+            "remaining": 7,
+            "purchases": [
+                {"reference": "P1", "name": "包装纸", "remaining": 4},
+                {"reference": "P2", "name": "包装纸", "remaining": 3},
+            ],
+        }])
+        self.assertEqual(StockRoom(self.root).supplier_outstanding("北辰包装"), [{
+            "code": "PAPER",
+            "unit": "张",
+            "remaining": 100,
+            "purchases": [{"reference": "P4", "name": "包装纸", "remaining": 100}],
+        }])
+
+    def test_known_supplier_without_outstanding_returns_empty_list(self):
+        self.app.save_supplier("仅档案", contact="李")
+        self.assertEqual(self.app.supplier_outstanding("仅档案"), [])
+        self.app.create_purchase("P1", "北辰", [{"code": "PAPER", "quantity": 5}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 5, "reference": "RCV-1"}])
+        self.app.create_purchase("P2", "北辰", [{"code": "BOX", "quantity": 2}])
+        self.app.cancel_purchase("P2")
+        self.assertEqual(StockRoom(self.root).supplier_outstanding("北辰"), [])
+
+    def test_unknown_and_history_only_names_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.supplier_outstanding("北辰")
+        self.app.create_purchase("P1", "北辰", [{"code": "PAPER", "quantity": 5}])
+        self.app.save_supplier("新名", contact="李")
+        self.app.merge_supplier("北辰", "新名")
+        with self.assertRaises(ValueError):
+            self.app.supplier_outstanding("北辰")
+        self.assertEqual(len(self.app.supplier_outstanding("新名")), 1)
+
+    def test_invalid_arguments_rejected(self):
+        self.app.create_purchase("P1", "北辰", [{"code": "PAPER", "quantity": 5}])
+        for supplier in (None, 123, "", "   ", [], {}):
+            with self.assertRaises(ValueError):
+                self.app.supplier_outstanding(supplier)
+
+    def test_exact_match_case_and_inner_whitespace(self):
+        self.app.create_purchase("P1", "北 辰", [{"code": "PAPER", "quantity": 5}])
+        self.assertEqual(len(self.app.supplier_outstanding(" 北 辰 ")), 1)
+        for supplier in ("北辰", "北  辰", "北 辰包装"):
+            with self.assertRaises(ValueError):
+                self.app.supplier_outstanding(supplier)
+
+    def test_grouping_by_code_and_unit_snapshot_sorted(self):
+        self.app.create_purchase("P2", "北辰", [{"code": "PAPER", "quantity": 5}])
+        self.app.update_material("PAPER", "包装纸", "包")
+        self.app.create_purchase("P1", "北辰", [
+            {"code": "PAPER", "quantity": 2},
+            {"code": "BOX", "quantity": 4},
+        ])
+        result = self.app.supplier_outstanding("北辰")
+        self.assertEqual([(item["code"], item["unit"], item["remaining"]) for item in result],
+                         [("BOX", "个", 4), ("PAPER", "包", 2), ("PAPER", "张", 5)])
+        self.assertEqual(result[2]["purchases"], [{"reference": "P2", "name": "包装纸", "remaining": 5}])
+
+    def test_movements_counts_reversals_and_material_changes_do_not_affect(self):
+        self.app.create_purchase("P1", "北辰", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.movement("PAPER", 5, "IN-1")
+        self.app.movement("PAPER", -3, "OUT-1")
+        self.app.count("PAPER", 8, "CNT-1")
+        self.app.reverse("IN-1", "REV-1")
+        self.app.update_material("PAPER", "新名称", "张")
+        self.app.set_active("PAPER", False)
+        result = StockRoom(self.root).supplier_outstanding("北辰")
+        self.assertEqual(result, [{
+            "code": "PAPER",
+            "unit": "张",
+            "remaining": 4,
+            "purchases": [{"reference": "P1", "name": "包装纸", "remaining": 4}],
+        }])
+
+    def test_latest_saved_orders_after_adjust_update_and_merge(self):
+        self.app.create_purchase("P1", "北辰", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.adjust_purchase_quantities("P1", [{"code": "PAPER", "quantity": 8}])
+        self.assertEqual(self.app.supplier_outstanding("北辰")[0]["remaining"], 2)
+        self.app.create_purchase("P2", "北辰", [{"code": "BOX", "quantity": 5}])
+        self.app.update_purchase("P2", "北辰", [{"code": "BOX", "quantity": 7}])
+        self.app.save_supplier("新名")
+        self.app.merge_supplier("北辰", "新名")
+        result = StockRoom(self.root).supplier_outstanding("新名")
+        self.assertEqual([(item["code"], item["remaining"]) for item in result],
+                         [("BOX", 7), ("PAPER", 2)])
+        with self.assertRaises(ValueError):
+            self.app.supplier_outstanding("北辰")
+
+    def test_query_is_read_only_and_creates_no_file(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        self.app.supplier_outstanding("北辰")
+        with self.assertRaises(ValueError):
+            self.app.supplier_outstanding("未知")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.supplier_outstanding("北辰")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_missing_purchases_or_receipts_treated_as_empty(self):
+        self.app.save_supplier("旧商")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchases", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(StockRoom(self.root).supplier_outstanding("旧商"), [])
+        self.app.create_purchase("P1", "旧商", [{"code": "PAPER", "quantity": 5}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 2, "reference": "RCV-1"}])
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchase_receipts", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = StockRoom(self.root).supplier_outstanding("旧商")
+        self.assertEqual(result[0]["remaining"], 5)
+        self.assertEqual(result[0]["purchases"][0]["remaining"], 5)
+
+    def test_cli_object_and_array_success_and_failure(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("outstanding.json", {"supplier": "北辰"})
+        result = self.run_cli("supplier-outstanding", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value, [{
+            "code": "PAPER",
+            "unit": "张",
+            "remaining": 7,
+            "purchases": [
+                {"reference": "P1", "name": "包装纸", "remaining": 4},
+                {"reference": "P2", "name": "包装纸", "remaining": 3},
+            ],
+        }])
+        array_payload = self.write_payload("outstanding-array.json", [
+            {"supplier": "北辰"}, {"supplier": "北辰包装"},
+        ])
+        result = self.run_cli("supplier-outstanding", array_payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual([item[0]["remaining"] for item in values], [7, 100])
+        bad = self.write_payload("bad.json", {"supplier": "未知"})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("supplier-outstanding", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)

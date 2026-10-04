@@ -1326,6 +1326,31 @@ class StockRoom(JsonStore):
             for row in history
         ]
 
+    def supplier_outstanding(self, supplier):
+        supplier = text(supplier, "supplier")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        orders = [order for order in data.get("purchases", []) if order["supplier"] == supplier]
+        if supplier not in profiles and not orders:
+            raise ValueError("unknown supplier")
+        groups = {}
+        for order in orders:
+            if order.get("status") != "open":
+                continue
+            received = self._received_totals(data, order["reference"])
+            for line in order.get("rows", []):
+                remaining = line["quantity"] - received.get(line["code"], 0)
+                if remaining <= 0:
+                    continue
+                key = (line["code"], line["unit"])
+                group = groups.setdefault(key, {"code": line["code"], "unit": line["unit"], "remaining": 0, "purchases": []})
+                group["remaining"] += remaining
+                group["purchases"].append({"reference": order["reference"], "name": line["name"], "remaining": remaining})
+        items = sorted(groups.values(), key=lambda item: (item["code"], item["unit"]))
+        for item in items:
+            item["purchases"].sort(key=lambda purchase: purchase["reference"])
+        return items
+
     @staticmethod
     def _supplier_snapshot(profile, name):
         # Normalized contact profile used for change snapshots; a missing
