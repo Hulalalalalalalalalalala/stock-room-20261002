@@ -2128,6 +2128,41 @@ class StockRoom(JsonStore):
             self._write(data)
         return planned
 
+    def import_locations_csv(self, content):
+        # CSV counterpart of assign_locations: the whole document is parsed
+        # and validated before anything is committed, then the parsed rows
+        # are planned and committed by the same rules as a direct batch, so
+        # the result, the history records and the no-change no-write
+        # behaviour all match. Inactive and zero-stock materials may be
+        # (un)assigned, and an empty location cancels the assignment.
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 2 or set(header) != {"code", "location"}:
+            raise ValueError("header must contain exactly the code and location columns")
+        positions = {name: header.index(name) for name in ("code", "location")}
+        records = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 2:
+                raise ValueError("each record must have exactly two columns")
+            code = row[positions["code"]].strip()
+            location = row[positions["location"]].strip()
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            records.append({"code": code, "location": location})
+        if not records:
+            return []
+        return self.assign_locations(records)
+
     def location_inventory(self, location):
         if not isinstance(location, str):
             raise ValueError("location must be a string")

@@ -7375,3 +7375,182 @@ class LocationTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
+
+
+class ImportLocationsCsvTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        # PAPER 库存十二、BOX 已停用且库存零，两者均归位到 A1。
+        self.app.movement("PAPER", 12, "IN-1")
+        self.app.set_active("BOX", False)
+        self.app.assign_locations([
+            {"code": "PAPER", "location": "A1"},
+            {"code": "BOX", "location": "A1"},
+        ])
+
+    def test_fixed_sample_import_survives_reopen(self):
+        self.seed_fixed_sample()
+        result = self.app.import_locations_csv("code,location\nPAPER,B1\nBOX,\n")
+        self.assertEqual(result, [
+            {"code": "PAPER", "before": "A1", "location": "B1"},
+            {"code": "BOX", "before": "A1", "location": ""},
+        ])
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["code"] for item in reopened.location_inventory("B1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("")], ["BOX"])
+        self.assertEqual(reopened.location_inventory("A1"), [])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 0)
+        self.assertEqual(reopened.location_changes("PAPER"), [
+            {"code": "PAPER", "sequence": 1, "before": "", "after": "A1"},
+            {"code": "PAPER", "sequence": 2, "before": "A1", "after": "B1"},
+        ])
+        self.assertEqual(reopened.location_changes("BOX"), [
+            {"code": "BOX", "sequence": 1, "before": "", "after": "A1"},
+            {"code": "BOX", "sequence": 2, "before": "A1", "after": ""},
+        ])
+        self.assertEqual(reopened.history("PAPER"), [{"code": "PAPER", "quantity": 12, "reference": "IN-1"}])
+        self.assertEqual(reopened.history("BOX"), [])
+
+    def test_reimport_same_content_adds_no_history_and_writes_nothing(self):
+        self.seed_fixed_sample()
+        content = "code,location\nPAPER,B1\nBOX,\n"
+        self.app.import_locations_csv(content)
+        before = self.app.path.read_bytes()
+        result = self.app.import_locations_csv(content)
+        self.assertEqual([row["before"] for row in result], ["B1", ""])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.location_changes("PAPER")), 2)
+        self.assertEqual(len(self.app.location_changes("BOX")), 2)
+
+    def test_unknown_code_rejects_whole_file(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.import_locations_csv("code,location\nPAPER,B1\nGHOST,C1\n")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("A1")], ["BOX", "PAPER"])
+        self.assertEqual(len(self.app.location_changes("PAPER")), 1)
+
+    def test_header_only_and_blank_lines_return_empty_without_writing(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        self.assertEqual(app.import_locations_csv("code,location\n"), [])
+        self.assertEqual(app.import_locations_csv("location,code\r\n\r\n\n"), [])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.import_locations_csv("code,location\n\n\n"), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_bom_crlf_reordered_header_and_quoted_fields(self):
+        content = "﻿location,code\r\n\"B,1\", PAPER \r\n\r\n\"\"\"\",\"BOX\"\r\n"
+        result = self.app.import_locations_csv(content)
+        self.assertEqual(result, [
+            {"code": "PAPER", "before": "", "location": "B,1"},
+            {"code": "BOX", "before": "", "location": '"'},
+        ])
+        self.assertEqual([item["code"] for item in self.app.location_inventory("B,1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in self.app.location_inventory('"')], ["BOX"])
+
+    def test_quoted_location_may_contain_newline(self):
+        result = self.app.import_locations_csv('code,location\nPAPER,"B\n1"\n')
+        self.assertEqual(result, [{"code": "PAPER", "before": "", "location": "B\n1"}])
+
+    def test_invalid_documents_rejected_and_file_preserved(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        bad_contents = [
+            11,
+            None,
+            "",
+            "   ",
+            "code,location,extra\nPAPER,B1,x\n",
+            "code\nPAPER\n",
+            "location\nB1\n",
+            "CODE,location\nPAPER,B1\n",
+            "code,location\nPAPER,B1,C1\n",
+            "code,location\nPAPER\n",
+            "code,location\n,B1\n",
+            "code,location\n  ,B1\n",
+            "code,location\n,\n",
+            "code,location\nPAPER,B1\npaper,B2\n",
+            "code,location\nPAPER,B1\nPAPER,B2\n",
+            "code,location\nPAPER,B1\nPAPER,B1\n",
+            'code,location\nPAPER,"B1\n',
+            'code,location\nPAPER,B"1\n',
+            'code,location\nPAPER,"B1"x\n',
+        ]
+        for content in bad_contents:
+            with self.assertRaises(ValueError, msg=repr(content)):
+                self.app.import_locations_csv(content)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("A1")], ["BOX", "PAPER"])
+
+    def test_whitespace_only_record_is_validated(self):
+        with self.assertRaises(ValueError):
+            self.app.import_locations_csv("code,location\n   \n")
+        with self.assertRaises(ValueError):
+            self.app.import_locations_csv("code,location\nPAPER,B1\n,\n")
+
+    def test_import_has_no_business_side_effects(self):
+        self.seed_fixed_sample()
+        self.app.import_locations_csv("code,location\nPAPER,B1\nBOX,\n")
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER"), {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 12})
+        self.assertEqual(reopened.material_status("BOX")["active"], False)
+        self.assertEqual(reopened.material_changes("PAPER"), [])
+        self.assertEqual([row["action"] for row in reopened.material_changes("BOX")], ["set_active"])
+        self.assertEqual(reopened.counts("PAPER"), [])
+        self.assertEqual(reopened.reversals("PAPER"), [])
+
+    def test_legacy_data_without_locations_imports_as_unassigned(self):
+        self.seed_fixed_sample()
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("locations", None)
+        data.pop("location_changes", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        result = reopened.import_locations_csv("code,location\nPAPER,B1\n")
+        self.assertEqual(result, [{"code": "PAPER", "before": "", "location": "B1"}])
+        self.assertEqual(reopened.location_changes("PAPER"),
+                         [{"code": "PAPER", "sequence": 1, "before": "", "after": "B1"}])
+
+    def test_cli_success_failure_and_array_independent_commits(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("import.json", {"content": "code,location\nPAPER,B1\nBOX,\n"})
+        result = self.run_cli("import-locations-csv", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["location"] for row in json.loads(result.stdout)], ["B1", ""])
+        query = self.write_payload("query.json", {"location": "B1"})
+        result = self.run_cli("location-inventory", query)
+        self.assertEqual([item["code"] for item in json.loads(result.stdout)], ["PAPER"])
+        bad = self.write_payload("bad.json", {"content": "code,location\nGHOST,C1\n"})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("import-locations-csv", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        array_payload = self.write_payload("array.json", [
+            {"content": "code,location\nPAPER,C1\n"},
+            {"content": "code,location\nGHOST,C1\n"},
+        ])
+        failed = self.run_cli("import-locations-csv", array_payload)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual([item["code"] for item in StockRoom(self.root).location_inventory("C1")], ["PAPER"])
