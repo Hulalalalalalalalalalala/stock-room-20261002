@@ -939,6 +939,65 @@ class StockRoom(JsonStore):
             self._write(data)
         return self._purchase_snapshot(order)
 
+    def reopen_purchases(self, references):
+        # Batch reopen of cancelled purchases so their remaining quantities
+        # can be received again. Every reference is validated against the
+        # pre-batch data before anything changes; the whole batch is
+        # rejected on the first failure. Already-open orders succeed as-is
+        # without any condition checks. Only cancelled-to-open transitions
+        # append a purchase change and trigger the write, so an all-open
+        # batch leaves the file untouched.
+        if not isinstance(references, list) or not references:
+            raise ValueError("references must be a nonempty list")
+        normalized = []
+        seen = set()
+        for entry in references:
+            reference = text(entry, "reference")
+            if reference in seen:
+                raise ValueError("reference already exists in batch")
+            seen.add(reference)
+            normalized.append(reference)
+        data = self._read()
+        orders = {order["reference"]: order for order in data.get("purchases", [])}
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        planned = []
+        for reference in normalized:
+            order = orders.get(reference)
+            if order is None:
+                raise ValueError("unknown purchase reference")
+            if order["status"] != "cancelled":
+                planned.append((order, False))
+                continue
+            received = self._received_totals(data, reference)
+            unreceived = [
+                line for line in order.get("rows", [])
+                if line["quantity"] - received.get(line["code"], 0) > 0
+            ]
+            if not unreceived:
+                raise ValueError("purchase has no remaining quantity")
+            for line in unreceived:
+                code = line["code"]
+                if code not in materials:
+                    raise ValueError("unknown material")
+                if not status.get(code, True):
+                    raise ValueError("material is inactive")
+                if materials[code]["unit"] != line["unit"]:
+                    raise ValueError("material unit differs from the purchase snapshot")
+            planned.append((order, True))
+        results = []
+        changed = False
+        for order, reopen in planned:
+            if reopen:
+                before = self._purchase_snapshot(order)
+                order["status"] = "open"
+                self._record_purchase_change(data, order, "reopen_purchases", before)
+                changed = True
+            results.append(self._purchase_snapshot(order))
+        if changed:
+            self._write(data)
+        return results
+
     def update_purchase(self, reference, supplier, rows):
         reference = text(reference, "reference")
         supplier = text(supplier, "supplier")
