@@ -2086,6 +2086,229 @@ class PreviewCountsTests(unittest.TestCase):
         self.assertEqual(self.app.counts("PAPER"), [])
 
 
+class ConfirmCountsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.movement("PAPER", 12, "IN-P")
+        self.app.movement("BOX", 3, "IN-B")
+        self.app.set_active("BOX", False)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def rows(self):
+        return [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+            {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+        ]
+
+    def test_success_fields_order_and_zero_difference_inactive(self):
+        rows = self.rows()
+        snapshot = json.loads(json.dumps(rows))
+        result = self.app.confirm_counts(rows)
+        self.assertEqual(result, [
+            {"code": "PAPER", "reference": "CNT-P", "before": 12, "counted": 8, "difference": -4},
+            {"code": "BOX", "reference": "CNT-B", "before": 3, "counted": 3, "difference": 0},
+        ])
+        self.assertEqual([set(row) for row in result],
+                         [{"code", "reference", "before", "counted", "difference"}] * 2)
+        # Input rows are not modified.
+        self.assertEqual(rows, snapshot)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 8)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual([row["reference"] for row in reopened.counts("PAPER")], ["CNT-P"])
+        self.assertEqual([row["reference"] for row in reopened.counts("BOX")], ["CNT-B"])
+        # Only the nonzero PAPER count appends an adjustment movement.
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("PAPER")],
+                         [(12, "IN-P"), (-4, "CNT-P")])
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("BOX")],
+                         [(3, "IN-B")])
+
+    def test_movement_before_submit_rejects_whole_batch_then_fixed_expected_succeeds(self):
+        self.app.movement("PAPER", 2, "IN-P2")
+        before = self.app.path.read_bytes()
+        rows = self.rows()
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts(rows)
+        # Whole batch rejected: file bytes, stock and counts untouched.
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        # Failed references stay reusable after fixing the expectation.
+        rows[0]["expected_before"] = 14
+        result = self.app.confirm_counts(rows)
+        self.assertEqual([(row["before"], row["difference"]) for row in result], [(14, -6), (3, 0)])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 8)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual(len(reopened.counts("PAPER")), 1)
+        self.assertEqual(len(reopened.counts("BOX")), 1)
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("PAPER")],
+                         [(12, "IN-P"), (2, "IN-P2"), (-6, "CNT-P")])
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("BOX")],
+                         [(3, "IN-B")])
+
+    def test_quantity_restored_by_movements_still_confirms(self):
+        self.app.movement("PAPER", -2, "OUT-P")
+        self.app.movement("PAPER", 2, "IN-P2")
+        result = self.app.confirm_counts([
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+        ])
+        self.assertEqual((result[0]["before"], result[0]["difference"]), (12, -4))
+
+    def test_profile_location_minimum_and_status_changes_do_not_block(self):
+        self.app.update_material("PAPER", "牛皮纸", "张")
+        self.app.set_minimum("PAPER", 10)
+        self.app.assign_locations([{"code": "PAPER", "location": "A-1"}])
+        self.app.set_active("PAPER", False)
+        result = self.app.confirm_counts([
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+        ])
+        self.assertEqual(result[0]["difference"], -4)
+
+    def test_expected_before_must_be_nonnegative_integer(self):
+        for expected in (-1, True, False, 1.5, 12.0, "12", None, [12]):
+            with self.subTest(expected_before=expected):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_counts([
+                        {"code": "PAPER", "counted": 8, "reference": "CNT-X", "expected_before": expected},
+                    ])
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([{"code": "PAPER", "counted": 8, "reference": "CNT-X"}])
+
+    def test_invalid_rows_shape_and_values_rejected(self):
+        bad_rows = [
+            [],
+            None,
+            "rows",
+            5,
+            ["not-an-object"],
+            [{"code": "PAPER", "counted": 8, "reference": "CNT-P"}],
+            [{"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12, "extra": 1}],
+        ]
+        for rows in bad_rows:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_counts(rows)
+        for counted in (-1, True, 1.5, "8", None):
+            with self.subTest(counted=counted):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_counts([
+                        {"code": "PAPER", "counted": counted, "reference": "CNT-X", "expected_before": 12},
+                    ])
+
+    def test_unknown_material_duplicates_and_reference_conflicts_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "OTHER", "counted": 1, "reference": "CNT-X", "expected_before": 0},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+                {"code": " PAPER ", "counted": 7, "reference": "CNT-2", "expected_before": 12},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": " CNT-1 ", "expected_before": 3},
+            ])
+        # Existing movement, count and reversal references all conflict.
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "PAPER", "counted": 8, "reference": "IN-P", "expected_before": 12},
+            ])
+        self.app.count("PAPER", 12, "CNT-ZERO")
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "BOX", "counted": 3, "reference": "CNT-ZERO", "expected_before": 3},
+            ])
+        self.app.movement("PAPER", 1, "IN-REV")
+        self.app.reverse("IN-REV", "REV-1")
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "BOX", "counted": 3, "reference": "REV-1", "expected_before": 3},
+            ])
+
+    def test_rejection_keeps_file_bytes_and_missing_file_not_created(self):
+        empty = Path(self.temp.name) / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.confirm_counts([{"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 0}])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": "CNT-2", "expected_before": 99},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+
+    def test_confirmed_counts_lock_unit_and_cannot_be_reversed(self):
+        self.app.confirm_counts(self.rows())
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装纸", "箱")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-P", "REV-1")
+
+    def test_count_batch_still_uses_latest_ledger(self):
+        result = self.app.count_batch([{"code": "PAPER", "counted": 8, "reference": "CNT-P"}])
+        self.assertEqual((result[0]["before"], result[0]["difference"]), (12, -4))
+
+    def test_legacy_data_without_movements_counts_stock_as_zero(self):
+        legacy = Path(self.temp.name) / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(
+            json.dumps({"materials": {"PAPER": {"code": "PAPER", "name": "包装纸", "unit": "张"}}}),
+            encoding="utf-8")
+        app = StockRoom(legacy)
+        result = app.confirm_counts([{"code": "PAPER", "counted": 5, "reference": "CNT-P", "expected_before": 0}])
+        self.assertEqual((result[0]["before"], result[0]["difference"]), (0, 5))
+
+    def test_cli_success_failure_and_array_independence(self):
+        payload = self.write_payload("confirm.json", {"rows": self.rows()})
+        result = self.run_cli("confirm-counts", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual([(row["before"], row["difference"]) for row in output], [(12, -4), (3, 0)])
+        # Failure: error JSON on stderr, exit code 2, ledger untouched.
+        before = self.app.path.read_bytes()
+        bad = self.write_payload("bad.json", {"rows": [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-X", "expected_before": 99},
+        ]})
+        failed = self.run_cli("confirm-counts", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # JSON array: each item commits independently, later failure keeps earlier success.
+        batch = self.write_payload("confirms.json", [
+            {"rows": [{"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 8}]},
+            {"rows": [{"code": "BOX", "counted": 2, "reference": "CNT-2", "expected_before": 99}]},
+        ])
+        mixed = self.run_cli("confirm-counts", batch)
+        self.assertEqual(mixed.returncode, 2)
+        self.assertIn("error", json.loads(mixed.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 8)
+        self.assertEqual(len(self.app.counts("PAPER")), 2)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(len(self.app.counts("BOX")), 1)
+
+
 class ImportMovementsCsvTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
