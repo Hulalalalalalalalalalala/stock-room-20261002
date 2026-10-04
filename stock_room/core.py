@@ -481,6 +481,60 @@ class StockRoom(JsonStore):
                            "difference": counted - before})
         return parsed
 
+    def confirm_counts(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        parsed = self._plan_confirmed_counts(data, rows)
+        counts = data.setdefault("counts", [])
+        movements = data.setdefault("movements", [])
+        for record in parsed:
+            counts.append(dict(record))
+            if record["difference"] != 0:
+                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return [dict(record) for record in parsed]
+
+    def _plan_confirmed_counts(self, data, rows):
+        # Batch count rules plus a confirmed-stock check: each row carries
+        # the ledger quantity the operator verified beforehand, and the
+        # whole batch is rejected unless every row's current ledger quantity
+        # still equals that expectation. Only the quantity is compared, so
+        # movements that restore the quantity, and any profile, location,
+        # minimum or status change, never block confirmation. Nothing is
+        # written here; the caller commits the plan atomically.
+        materials = data.get("materials", {})
+        existing = data.get("movements", [])
+        parsed = []
+        seen_codes = set()
+        seen_references = set()
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "counted", "reference", "expected_before"}:
+                raise ValueError("each row must be an object with code, counted, reference and expected_before")
+            code = text(entry["code"], "code")
+            reference = text(entry["reference"], "reference")
+            counted = entry["counted"]
+            if type(counted) is not int or counted < 0:
+                raise ValueError("counted must be a nonnegative integer")
+            expected_before = entry["expected_before"]
+            if type(expected_before) is not int or expected_before < 0:
+                raise ValueError("expected_before must be a nonnegative integer")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if code in seen_codes:
+                raise ValueError("material already exists in batch")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            before = sum(row["quantity"] for row in existing if row["code"] == code)
+            if before != expected_before:
+                raise ValueError("ledger quantity differs from expected_before")
+            seen_codes.add(code)
+            seen_references.add(reference)
+            parsed.append({"code": code, "reference": reference, "before": before, "counted": counted,
+                           "difference": counted - before})
+        return parsed
+
     def counts(self, code):
         code = text(code, "code")
         data = self._read()

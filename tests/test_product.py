@@ -6690,3 +6690,172 @@ class LocationTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
+
+
+class ConfirmCountsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        self.app.movement("PAPER", 12, "IN-1")
+        self.app.movement("BOX", 3, "IN-2")
+
+    def confirm_rows(self, paper_expected=12, box_expected=3):
+        return [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": paper_expected},
+            {"code": "BOX", "counted": 3, "reference": "CNT-2", "expected_before": box_expected},
+        ]
+
+    def test_fixed_sample_confirm_success_and_reopen(self):
+        self.seed_fixed_sample()
+        rows = self.confirm_rows()
+        result = self.app.confirm_counts(rows)
+        self.assertEqual(result, [
+            {"code": "PAPER", "reference": "CNT-1", "before": 12, "counted": 8, "difference": -4},
+            {"code": "BOX", "reference": "CNT-2", "before": 3, "counted": 3, "difference": 0},
+        ])
+        self.assertEqual(rows, self.confirm_rows())
+        self.assertEqual([row["quantity"] for row in self.app.history("PAPER")], [12, -4])
+        self.assertEqual([row["quantity"] for row in self.app.history("BOX")], [3])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 8)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual(len(reopened.counts("PAPER")), 1)
+        self.assertEqual(len(reopened.counts("BOX")), 1)
+        self.assertEqual(reopened.counts("BOX")[0]["difference"], 0)
+
+    def test_fixed_sample_interim_movement_rejects_then_corrected_expected_succeeds(self):
+        self.seed_fixed_sample()
+        self.app.movement("PAPER", 2, "IN-3")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts(self.confirm_rows())
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 14)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        result = self.app.confirm_counts(self.confirm_rows(paper_expected=14))
+        self.assertEqual([row["difference"] for row in result], [-6, 0])
+        reopened = StockRoom(self.root)
+        self.assertEqual(len(reopened.counts("PAPER")), 1)
+        self.assertEqual(len(reopened.counts("BOX")), 1)
+        self.assertEqual([row["quantity"] for row in reopened.history("PAPER")], [12, 2, -6])
+        self.assertEqual([row["quantity"] for row in reopened.history("BOX")], [3])
+
+    def test_quantity_restored_by_interim_movements_still_confirms(self):
+        self.seed_fixed_sample()
+        self.app.movement("PAPER", 5, "IN-3")
+        self.app.movement("PAPER", -5, "OUT-1")
+        result = self.app.confirm_counts(self.confirm_rows())
+        self.assertEqual(result[0]["before"], 12)
+
+    def test_profile_location_minimum_and_status_changes_do_not_block(self):
+        self.seed_fixed_sample()
+        self.app.set_minimum("PAPER", 20)
+        self.app.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        self.app.set_active("BOX", False)
+        self.app.update_material("PAPER", "再生包装纸", "张")
+        result = self.app.confirm_counts(self.confirm_rows())
+        self.assertEqual([row["difference"] for row in result], [-4, 0])
+
+    def test_inactive_material_can_confirm(self):
+        self.seed_fixed_sample()
+        self.app.set_active("BOX", False)
+        result = self.app.confirm_counts([{"code": "BOX", "counted": 1, "reference": "CNT-1", "expected_before": 3}])
+        self.assertEqual(result[0]["difference"], -2)
+
+    def test_expected_before_type_validation(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        for bad in (True, False, 12.0, "12", None, [12], -1):
+            with self.subTest(expected_before=bad):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_counts([{"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": bad}])
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts([{"code": "PAPER", "counted": 8, "reference": "CNT-1"}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_batch_validation_rejects_wholesale(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        invalid = [
+            [],
+            "rows",
+            [{"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12, "extra": 1}],
+            [{"code": "GHOST", "counted": 8, "reference": "CNT-1", "expected_before": 0}],
+            [{"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+             {"code": "PAPER", "counted": 8, "reference": "CNT-2", "expected_before": 12}],
+            [{"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+             {"code": "BOX", "counted": 3, "reference": "CNT-1", "expected_before": 3}],
+            [{"code": "PAPER", "counted": 8, "reference": "IN-1", "expected_before": 12}],
+            [{"code": "PAPER", "counted": True, "reference": "CNT-1", "expected_before": 12}],
+        ]
+        for rows in invalid:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_counts(rows)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.counts("PAPER"), [])
+
+    def test_failed_reference_can_be_reused_after_fix(self):
+        self.seed_fixed_sample()
+        with self.assertRaises(ValueError):
+            self.app.confirm_counts(self.confirm_rows(paper_expected=11))
+        result = self.app.confirm_counts(self.confirm_rows())
+        self.assertEqual(result[0]["reference"], "CNT-1")
+
+    def test_missing_file_not_created_on_failure(self):
+        fresh = StockRoom(self.root / "fresh")
+        with self.assertRaises(ValueError):
+            fresh.confirm_counts([{"code": "PAPER", "counted": 1, "reference": "CNT-1", "expected_before": 1}])
+        self.assertFalse(fresh.path.exists())
+
+    def test_confirmed_counts_lock_unit_and_cannot_be_reversed(self):
+        self.seed_fixed_sample()
+        self.app.confirm_counts(self.confirm_rows())
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装纸", "卷")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-1", "REV-1")
+
+    def test_cli_object_success_and_failure(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("confirm.json", {"rows": self.confirm_rows()})
+        result = self.run_cli("confirm-counts", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([row["difference"] for row in value], [-4, 0])
+        bad = self.write_payload("bad.json", {"rows": self.confirm_rows()})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("confirm-counts", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_array_items_commit_independently(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("array.json", [
+            {"rows": [{"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12}]},
+            {"rows": [{"code": "BOX", "counted": 3, "reference": "CNT-2", "expected_before": 99}]},
+        ])
+        result = self.run_cli("confirm-counts", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 8)
+        self.assertEqual(len(self.app.counts("PAPER")), 1)
+        self.assertEqual(self.app.counts("BOX"), [])
