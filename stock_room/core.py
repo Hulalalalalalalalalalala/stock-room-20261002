@@ -1719,6 +1719,104 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def assign_locations(self, rows):
+        # Batch storage-location assignment: each row names one known
+        # material and one normalized location (empty after stripping means
+        # unassign). Rows validate against the pre-batch state, so repeated
+        # codes within a batch are rejected; inactive and zero-stock
+        # materials are allowed. Only assignments whose normalized location
+        # actually changes grow the per-material change history; an entirely
+        # unchanged batch succeeds without writing the file.
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        materials = data.get("materials", {})
+        locations = data.get("locations", {})
+        parsed = []
+        seen = set()
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "location"}:
+                raise ValueError("each row must be an object with code and location")
+            raw_code = entry["code"]
+            raw_location = entry["location"]
+            if not isinstance(raw_code, str) or not raw_code.strip():
+                raise ValueError("code must be a nonempty string")
+            if not isinstance(raw_location, str):
+                raise ValueError("location must be a string")
+            code = raw_code.strip()
+            location = raw_location.strip()
+            if code not in materials:
+                raise ValueError("unknown material")
+            if code in seen:
+                raise ValueError("material already exists in batch")
+            seen.add(code)
+            before = locations.get(code, "")
+            parsed.append({"code": code, "before": before, "location": location})
+        changed = False
+        for row in parsed:
+            code, before, location = row["code"], row["before"], row["location"]
+            if location == before:
+                continue
+            records = data.setdefault("location_changes", {}).setdefault(code, [])
+            records.append({
+                "code": code,
+                "sequence": len(records) + 1,
+                "before": before,
+                "after": location,
+            })
+            if location:
+                locations[code] = location
+            else:
+                locations.pop(code, None)
+            changed = True
+        if changed:
+            data["locations"] = locations
+            self._write(data)
+        return [{"code": row["code"], "before": row["before"], "location": row["location"]} for row in parsed]
+
+    def location_inventory(self, location):
+        # Exact-match inventory view for one normalized location; the empty
+        # string queries materials without a location. Results reuse the
+        # default inventory item shape plus a location field, sorted by code.
+        if not isinstance(location, str):
+            raise ValueError("location must be a string")
+        location = location.strip()
+        data = self._read()
+        movements = data.get("movements", [])
+        minimums = data.get("minimums", {})
+        status = data.get("status", {})
+        locations = data.get("locations", {})
+        items = []
+        for code, material in data.get("materials", {}).items():
+            if locations.get(code, "") != location:
+                continue
+            quantity = sum(row["quantity"] for row in movements if row["code"] == code)
+            items.append({
+                "code": code,
+                "name": material["name"],
+                "unit": material["unit"],
+                "quantity": quantity,
+                "minimum": minimums.get(code, 0),
+                "active": status.get(code, True),
+                "location": locations.get(code, ""),
+            })
+        items.sort(key=lambda item: item["code"])
+        return items
+
+    def location_changes(self, code):
+        # Per-material location history with a sequence continuous from 1.
+        # Every successful assignment that changes the normalized location
+        # appends one record, including the first assignment from the
+        # unassigned state; legacy data simply has no records.
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return [
+            {"code": code, "sequence": row["sequence"], "before": row["before"], "after": row["after"]}
+            for row in data.get("location_changes", {}).get(code, [])
+        ]
+
     def export_inventory_csv(self, keyword="", active=None):
         items = self.inventory(keyword=keyword, active=active)
         lines = ["code,name,unit,quantity,minimum,active"]
