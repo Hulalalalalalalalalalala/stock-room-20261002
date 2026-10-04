@@ -1854,6 +1854,63 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def create_replenishment_purchase(self, reference, supplier, codes):
+        # Order the live replenishment suggestion for the selected materials
+        # as one purchase. Every code is validated against the registry and
+        # the open-purchase pipeline before anything is written, so a failure
+        # leaves the stored bytes and the reference namespace untouched.
+        reference = text(reference, "reference")
+        supplier = text(supplier, "supplier")
+        if not isinstance(codes, list) or not codes:
+            raise ValueError("codes must be a nonempty list")
+        selected = []
+        seen = set()
+        for entry in codes:
+            code = text(entry, "code")
+            if code in seen:
+                raise ValueError("material already exists in purchase")
+            seen.add(code)
+            selected.append(code)
+        data = self._read()
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        minimums = data.get("minimums", {})
+        movements = data.get("movements", [])
+        if any(order["reference"] == reference for order in data.get("purchases", [])):
+            raise ValueError("reference already exists")
+        for code in selected:
+            if code not in materials:
+                raise ValueError("unknown material")
+            if not status.get(code, True):
+                raise ValueError("material is inactive")
+        incoming = {}
+        for order in data.get("purchases", []):
+            if order.get("status") != "open":
+                continue
+            received = self._received_totals(data, order["reference"])
+            for line in order.get("rows", []):
+                code = line["code"]
+                if code not in seen:
+                    continue
+                remaining = line["quantity"] - received.get(code, 0)
+                if remaining <= 0:
+                    continue
+                if line["unit"] != materials[code]["unit"]:
+                    raise ValueError("purchase unit differs from the current material unit")
+                incoming[code] = incoming.get(code, 0) + remaining
+        rows = []
+        for code in selected:
+            material = materials[code]
+            quantity = sum(row["quantity"] for row in movements if row["code"] == code)
+            suggested = max(minimums.get(code, 0) - quantity - incoming.get(code, 0), 0)
+            if suggested == 0:
+                raise ValueError("no replenishment suggested")
+            rows.append({"code": code, "name": material["name"], "unit": material["unit"], "quantity": suggested})
+        order = {"reference": reference, "supplier": supplier, "status": "open", "rows": rows}
+        data.setdefault("purchases", []).append(order)
+        self._write(data)
+        return self._purchase_snapshot(order)
+
     def assign_locations(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
