@@ -2128,6 +2128,64 @@ class StockRoom(JsonStore):
             self._write(data)
         return planned
 
+    def confirm_locations(self, rows):
+        # Optimistic counterpart of assign_locations: each row also carries
+        # the location the operator verified from a query (expected_location,
+        # empty meaning unassigned), and the whole batch is rejected when any
+        # row's current location differs. Only the location is compared — a
+        # move away and back still allows confirmation, and stock, profile,
+        # minimum or active changes never block one. Inactive and zero-stock
+        # materials may be confirmed, and one location may still hold several
+        # materials. Everything is validated before the single write, and a
+        # batch where every location already matches succeeds without writing
+        # or appending history.
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        materials = data.get("materials", {})
+        locations = data.get("locations", {})
+        seen = set()
+        planned = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "expected_location", "location"}:
+                raise ValueError("each row must be an object with code, expected_location and location")
+            code = text(entry["code"], "code")
+            expected_location = entry["expected_location"]
+            location = entry["location"]
+            if not isinstance(expected_location, str) or not isinstance(location, str):
+                raise ValueError("expected_location and location must be strings")
+            expected_location = expected_location.strip()
+            location = location.strip()
+            if code not in materials:
+                raise ValueError("unknown material")
+            if code in seen:
+                raise ValueError("material already exists in batch")
+            seen.add(code)
+            current = locations.get(code, "")
+            if current != expected_location:
+                raise ValueError("location does not match the expected location")
+            planned.append({"code": code, "before": current, "location": location})
+        if any(row["before"] != row["location"] for row in planned):
+            updated = data.setdefault("locations", {})
+            histories = data.setdefault("location_changes", {})
+            for row in planned:
+                if row["before"] == row["location"]:
+                    continue
+                code = row["code"]
+                if row["location"]:
+                    updated[code] = row["location"]
+                else:
+                    updated.pop(code, None)
+                records = histories.setdefault(code, [])
+                records.append({
+                    "code": code,
+                    "sequence": len(records) + 1,
+                    "before": row["before"],
+                    "after": row["location"],
+                })
+            self._write(data)
+        return planned
+
     def import_locations_csv(self, content):
         # CSV counterpart of assign_locations: the whole document is parsed
         # and validated before anything is committed, then the parsed rows

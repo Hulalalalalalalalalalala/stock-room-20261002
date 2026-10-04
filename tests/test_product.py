@@ -7554,3 +7554,274 @@ class ImportLocationsCsvTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual([item["code"] for item in StockRoom(self.root).location_inventory("C1")], ["PAPER"])
+
+class ConfirmLocationsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        # PAPER 归位 A1，BOX 未归位。
+        self.app.assign_locations([{"code": "PAPER", "location": "A1"}])
+
+    def confirm_rows(self):
+        return [
+            {"code": "PAPER", "expected_location": "A1", "location": "B1"},
+            {"code": "BOX", "expected_location": "", "location": "A1"},
+        ]
+
+    def test_fixed_sample_success_adds_one_history_each(self):
+        self.seed_fixed_sample()
+        result = self.app.confirm_locations(self.confirm_rows())
+        self.assertEqual(result, [
+            {"code": "PAPER", "before": "A1", "location": "B1"},
+            {"code": "BOX", "before": "", "location": "A1"},
+        ])
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["code"] for item in reopened.location_inventory("B1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("A1")], ["BOX"])
+        self.assertEqual(reopened.location_changes("PAPER"), [
+            {"code": "PAPER", "sequence": 1, "before": "", "after": "A1"},
+            {"code": "PAPER", "sequence": 2, "before": "A1", "after": "B1"},
+        ])
+        self.assertEqual(reopened.location_changes("BOX"), [
+            {"code": "BOX", "sequence": 1, "before": "", "after": "A1"},
+        ])
+
+    def test_fixed_sample_concurrent_change_rejects_whole_batch(self):
+        self.seed_fixed_sample()
+        # 提交前 BOX 已被归到 C1（模拟查询后的归位变化）。
+        self.app.assign_locations([{"code": "BOX", "location": "C1"}])
+        paper_history_before = list(self.app.location_changes("PAPER"))
+        with self.assertRaises(ValueError):
+            self.app.confirm_locations(self.confirm_rows())
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["code"] for item in reopened.location_inventory("A1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("C1")], ["BOX"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("B1")], [])
+        self.assertEqual(reopened.location_changes("PAPER"), paper_history_before)
+        self.assertEqual(reopened.location_changes("BOX"), [
+            {"code": "BOX", "sequence": 1, "before": "", "after": "C1"},
+        ])
+
+    def test_whitespace_normalized_and_input_not_modified(self):
+        self.seed_fixed_sample()
+        rows = [
+            {"code": " PAPER ", "expected_location": " A1 ", "location": " B 1 "},
+            {"code": "BOX", "expected_location": "   ", "location": ""},
+        ]
+        snapshot = json.dumps(rows, ensure_ascii=False)
+        result = self.app.confirm_locations(rows)
+        self.assertEqual(result, [
+            {"code": "PAPER", "before": "A1", "location": "B 1"},
+            {"code": "BOX", "before": "", "location": ""},
+        ])
+        self.assertEqual(json.dumps(rows, ensure_ascii=False), snapshot)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("B 1")], ["PAPER"])
+
+    def test_moved_away_and_back_still_confirms(self):
+        self.seed_fixed_sample()
+        self.app.assign_locations([{"code": "PAPER", "location": "X9"}])
+        self.app.assign_locations([{"code": "PAPER", "location": "A1"}])
+        result = self.app.confirm_locations([
+            {"code": "PAPER", "expected_location": "A1", "location": "B1"},
+        ])
+        self.assertEqual(result, [{"code": "PAPER", "before": "A1", "location": "B1"}])
+        # 初始归位 A1、移到 X9、移回 A1、确认到 B1，共四条归位历史。
+        self.assertEqual(len(self.app.location_changes("PAPER")), 4)
+
+    def test_stock_profile_minimum_and_active_changes_do_not_block(self):
+        self.seed_fixed_sample()
+        self.app.movement("PAPER", 12, "IN-1")
+        self.app.movement("PAPER", -4, "OUT-1")
+        self.app.count("PAPER", 8, "CNT-1")
+        self.app.update_material("PAPER", "复印纸", "张")
+        self.app.set_minimum("PAPER", 5)
+        self.app.set_active("BOX", False)
+        result = self.app.confirm_locations(self.confirm_rows())
+        self.assertEqual([row["location"] for row in result], ["B1", "A1"])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 8)
+        self.assertEqual(reopened.material_status("BOX")["active"], False)
+        self.assertEqual([item["code"] for item in reopened.location_inventory("A1")], ["BOX"])
+
+    def test_inactive_zero_stock_and_shared_location_allowed(self):
+        self.app.set_active("BOX", False)
+        self.app.assign_locations([
+            {"code": "PAPER", "location": "A1"},
+            {"code": "BOX", "location": "A1"},
+        ])
+        result = self.app.confirm_locations([
+            {"code": "BOX", "expected_location": "A1", "location": "A2"},
+            {"code": "PAPER", "expected_location": "A1", "location": "A2"},
+        ])
+        self.assertEqual([row["before"] for row in result], ["A1", "A1"])
+        self.assertEqual([item["code"] for item in self.app.location_inventory("A2")], ["BOX", "PAPER"])
+
+    def test_cancel_assignment_with_empty_target(self):
+        self.seed_fixed_sample()
+        result = self.app.confirm_locations([
+            {"code": "PAPER", "expected_location": "A1", "location": "  "},
+        ])
+        self.assertEqual(result, [{"code": "PAPER", "before": "A1", "location": ""}])
+        self.assertEqual([item["code"] for item in self.app.location_inventory("")], ["BOX", "PAPER"])
+
+    def test_no_change_batch_succeeds_without_writing(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        paper_history = len(self.app.location_changes("PAPER"))
+        result = self.app.confirm_locations([
+            {"code": " PAPER ", "expected_location": "A1", "location": " A1 "},
+            {"code": "BOX", "expected_location": "", "location": ""},
+        ])
+        self.assertEqual(result, [
+            {"code": "PAPER", "before": "A1", "location": "A1"},
+            {"code": "BOX", "before": "", "location": ""},
+        ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.location_changes("PAPER")), paper_history)
+        self.assertEqual(self.app.location_changes("BOX"), [])
+
+    def test_partial_change_writes_only_changed_materials(self):
+        self.seed_fixed_sample()
+        result = self.app.confirm_locations([
+            {"code": "PAPER", "expected_location": "A1", "location": "A1"},
+            {"code": "BOX", "expected_location": "", "location": "A1"},
+        ])
+        self.assertEqual([row["before"] for row in result], ["A1", ""])
+        self.assertEqual(len(self.app.location_changes("PAPER")), 1)
+        self.assertEqual(len(self.app.location_changes("BOX")), 1)
+
+    def test_invalid_batches_rejected_and_file_preserved(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        bad_rows = [
+            None,
+            [],
+            "PAPER",
+            [{"code": "PAPER", "expected_location": "A1"}],
+            [{"code": "PAPER", "location": "B1"}],
+            [{"expected_location": "A1", "location": "B1"}],
+            [{"code": "PAPER", "expected_location": "A1", "location": "B1", "extra": 1}],
+            [{"code": "PAPER", "expected_location": "A1", "location": "B1"},
+             {"code": "PAPER", "expected_location": None, "location": "B1"}],
+            [{"code": "", "expected_location": "A1", "location": "B1"}],
+            [{"code": "  ", "expected_location": "A1", "location": "B1"}],
+            [{"code": 1, "expected_location": "A1", "location": "B1"}],
+            [{"code": None, "expected_location": "A1", "location": "B1"}],
+            [{"code": "PAPER", "expected_location": 1, "location": "B1"}],
+            [{"code": "PAPER", "expected_location": None, "location": "B1"}],
+            [{"code": "PAPER", "expected_location": "A1", "location": 1}],
+            [{"code": "PAPER", "expected_location": "A1", "location": None}],
+            [{"code": "GHOST", "expected_location": "", "location": "A1"}],
+            [{"code": "PAPER", "expected_location": "A1", "location": "B1"},
+             {"code": " PAPER ", "expected_location": "B1", "location": "C1"}],
+            [{"code": "PAPER", "expected_location": "", "location": "B1"}],
+            [{"code": "PAPER", "expected_location": "a1", "location": "B1"}],
+            [{"code": "BOX", "expected_location": "A1", "location": "B1"}],
+        ]
+        for rows in bad_rows:
+            with self.assertRaises(ValueError, msg=repr(rows)):
+                self.app.confirm_locations(rows)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("A1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in self.app.location_inventory("")], ["BOX"])
+        self.assertEqual(len(self.app.location_changes("PAPER")), 1)
+        self.assertEqual(self.app.location_changes("BOX"), [])
+
+    def test_mismatch_anywhere_aborts_all_rows(self):
+        self.seed_fixed_sample()
+        self.app.assign_locations([{"code": "BOX", "location": "C1"}])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.confirm_locations([
+                {"code": "PAPER", "expected_location": "A1", "location": "B1"},
+                {"code": "BOX", "expected_location": "", "location": "A1"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("A1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in self.app.location_inventory("C1")], ["BOX"])
+
+    def test_failure_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.confirm_locations([{"code": "PAPER", "expected_location": "", "location": "A1"}])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_without_locations_confirms_as_unassigned(self):
+        self.seed_fixed_sample()
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("locations", None)
+        data.pop("location_changes", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        result = reopened.confirm_locations([
+            {"code": "PAPER", "expected_location": "", "location": "B1"},
+            {"code": "BOX", "expected_location": "", "location": ""},
+        ])
+        self.assertEqual([row["before"] for row in result], ["", ""])
+        self.assertEqual(reopened.location_changes("PAPER"),
+                         [{"code": "PAPER", "sequence": 1, "before": "", "after": "B1"}])
+        self.assertEqual(reopened.location_changes("BOX"), [])
+
+    def test_confirmation_has_no_business_side_effects(self):
+        self.seed_fixed_sample()
+        self.app.movement("PAPER", 12, "IN-1")
+        self.app.confirm_locations(self.confirm_rows())
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.history("PAPER"), [{"code": "PAPER", "quantity": 12, "reference": "IN-1"}])
+        self.assertEqual(reopened.history("BOX"), [])
+        self.assertEqual(reopened.material_changes("PAPER"), [])
+        self.assertEqual(reopened.counts("PAPER"), [])
+        self.assertEqual(reopened.reversals("PAPER"), [])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 0)
+        # 归位历史不锁定单位变更。
+        self.app.register("EMPTY", "空料", "件")
+        self.app.confirm_locations([{"code": "EMPTY", "expected_location": "", "location": "Z-9"}])
+        self.assertEqual(self.app.update_material("EMPTY", "空料", "箱")["unit"], "箱")
+
+    def test_cli_success_failure_and_array_independent_commits(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("confirm.json", {"rows": self.confirm_rows()})
+        result = self.run_cli("confirm-locations", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [
+            {"code": "PAPER", "before": "A1", "location": "B1"},
+            {"code": "BOX", "before": "", "location": "A1"},
+        ])
+        # 第二遍：PAPER 预期仍是 A1，与当前 B1 不符，整次失败。
+        bad = self.write_payload("bad.json", {"rows": self.confirm_rows()})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("confirm-locations", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # JSON 数组独立提交：先把 PAPER 从 B1 改到 C1 成功，第二项预期错误失败，前项保留。
+        array_payload = self.write_payload("array.json", [
+            {"rows": [{"code": "PAPER", "expected_location": "B1", "location": "C1"}]},
+            {"rows": [{"code": "BOX", "expected_location": "", "location": "D1"}]},
+        ])
+        failed = self.run_cli("confirm-locations", array_payload)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["code"] for item in reopened.location_inventory("C1")], ["PAPER"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("A1")], ["BOX"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("D1")], [])
+        self.assertEqual(len(reopened.location_changes("PAPER")), 3)
+        self.assertEqual(len(reopened.location_changes("BOX")), 1)
