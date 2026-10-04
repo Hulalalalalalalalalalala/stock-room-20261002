@@ -1412,6 +1412,68 @@ class StockRoom(JsonStore):
             item["purchases"].sort(key=lambda purchase: purchase["reference"])
         return items
 
+    def supplier_ledger(self, supplier, kind=None):
+        supplier = text(supplier, "supplier")
+        if kind is not None and kind not in ("purchase_receipt", "purchase_return"):
+            raise ValueError("kind must be purchase_receipt, purchase_return or None")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        orders = [order for order in data.get("purchases", []) if order.get("supplier") == supplier]
+        if supplier not in profiles and not orders:
+            raise ValueError("unknown supplier")
+        order_lines = {order["reference"]: {line["code"]: line for line in order.get("rows", [])} for order in orders}
+        receipts = {}
+        for order in orders:
+            for receipt in data.get("purchase_receipts", {}).get(order["reference"], []):
+                receipts[receipt["reference"]] = (order["reference"], receipt)
+        returns = {}
+        for order in orders:
+            for record in data.get("purchase_returns", {}).get(order["reference"], []):
+                returns[record["reference"]] = (order["reference"], record)
+        # Walk the whole-ledger movements in registration order so receipts
+        # and returns interleave exactly as they happened, independently of
+        # purchase reference order. The running net is keyed by the purchase
+        # snapshot code/unit pair and always counts every matching movement,
+        # even when the kind filter hides the current row.
+        net = {}
+        entries = []
+        for movement in data.get("movements", []):
+            reference = movement["reference"]
+            found = receipts.get(reference)
+            if found is not None:
+                purchase_reference, receipt = found
+                entry_kind = "purchase_receipt"
+                related_reference = None
+                code = receipt["code"]
+            else:
+                found = returns.get(reference)
+                if found is None:
+                    continue
+                purchase_reference, record = found
+                entry_kind = "purchase_return"
+                related_reference = record["receipt_reference"]
+                code = record["code"]
+            line = order_lines[purchase_reference].get(code)
+            if line is None:
+                # Legacy data with receipt/return links but no matching
+                # purchase line contributes no ledger rows.
+                continue
+            key = (line["code"], line["unit"])
+            net[key] = net.get(key, 0) + movement["quantity"]
+            if kind is None or kind == entry_kind:
+                entries.append({
+                    "code": line["code"],
+                    "name": line["name"],
+                    "unit": line["unit"],
+                    "quantity": movement["quantity"],
+                    "reference": reference,
+                    "kind": entry_kind,
+                    "purchase_reference": purchase_reference,
+                    "related_reference": related_reference,
+                    "net_received": net[key],
+                })
+        return entries
+
     @staticmethod
     def _supplier_snapshot(profile, name):
         # Normalized contact profile used for change snapshots; a missing
