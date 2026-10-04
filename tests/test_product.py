@@ -2309,6 +2309,307 @@ class ConfirmCountsTests(unittest.TestCase):
         self.assertEqual(len(self.app.counts("BOX")), 1)
 
 
+class ConfirmLocationCountsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+        self.app.register("EMPTY", "空料", "件")
+        self.app.movement("PAPER", 12, "IN-P")
+        self.app.movement("BOX", 3, "IN-B")
+        self.app.set_active("BOX", False)
+        self.app.assign_locations([
+            {"code": "PAPER", "location": "A1"},
+            {"code": "BOX", "location": "A1"},
+            {"code": "EMPTY", "location": "B1"},
+        ])
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def rows(self):
+        return [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+            {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+        ]
+
+    def test_success_fields_order_and_only_nonzero_adjusts(self):
+        rows = self.rows()
+        snapshot = json.loads(json.dumps(rows))
+        result = self.app.confirm_location_counts(" A1 ", rows)
+        self.assertEqual(result, [
+            {"code": "PAPER", "reference": "CNT-P", "before": 12, "counted": 8, "difference": -4},
+            {"code": "BOX", "reference": "CNT-B", "before": 3, "counted": 3, "difference": 0},
+        ])
+        self.assertEqual([set(row) for row in result],
+                         [{"code", "reference", "before", "counted", "difference"}] * 2)
+        # Input rows are not modified.
+        self.assertEqual(rows, snapshot)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 8)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 3)
+        self.assertEqual([row["reference"] for row in reopened.counts("PAPER")], ["CNT-P"])
+        self.assertEqual([row["reference"] for row in reopened.counts("BOX")], ["CNT-B"])
+        # Only the nonzero PAPER count appends an adjustment movement.
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("PAPER")],
+                         [(12, "IN-P"), (-4, "CNT-P")])
+        self.assertEqual([(row["quantity"], row["reference"]) for row in reopened.history("BOX")],
+                         [(3, "IN-B")])
+
+    def test_material_moved_to_other_location_rejects_then_requery_succeeds(self):
+        self.app.assign_locations([{"code": "BOX", "location": "B1"}])
+        before = self.app.path.read_bytes()
+        rows = self.rows()
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", rows)
+        # Whole request rejected: file bytes and stock untouched.
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+        # Failed references stay reusable; after re-querying, only PAPER is at A1.
+        result = self.app.confirm_location_counts("A1", [rows[0]])
+        self.assertEqual([(row["before"], row["difference"]) for row in result], [(12, -4)])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 8)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+
+    def test_rows_must_cover_every_material_including_inactive_and_zero_stock(self):
+        # Inactive zero-stock material at the location cannot be omitted.
+        self.app.assign_locations([{"code": "EMPTY", "location": "A1"}])
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", self.rows())
+        # Order of the rows does not matter as long as coverage is complete.
+        result = self.app.confirm_location_counts("A1", [
+            {"code": "EMPTY", "counted": 0, "reference": "CNT-E", "expected_before": 0},
+            {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+        ])
+        self.assertEqual([row["code"] for row in result], ["EMPTY", "BOX", "PAPER"])
+
+    def test_material_from_other_location_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+                {"code": "EMPTY", "counted": 0, "reference": "CNT-E", "expected_before": 0},
+            ])
+
+    def test_empty_location_rejects_even_when_rows_match_unassigned(self):
+        # No material is assigned to C9, so the location has no materials.
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("C9", self.rows())
+        # Empty string targets unassigned materials; none are unassigned here.
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("", self.rows())
+
+    def test_unassigned_location_supports_blank_location_string(self):
+        self.app.assign_locations([
+            {"code": "PAPER", "location": ""},
+            {"code": "BOX", "location": ""},
+        ])
+        # Now EMPTY (still at B1) is excluded; PAPER and BOX are unassigned.
+        result = self.app.confirm_location_counts("  ", [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+            {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+        ])
+        self.assertEqual([(row["code"], row["difference"]) for row in result],
+                         [("PAPER", -4), ("BOX", 0)])
+
+    def test_location_string_is_case_sensitive_after_stripping(self):
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("a1", self.rows())
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts(None, self.rows())
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts(1, self.rows())
+
+    def test_expected_before_mismatch_rejects_whole_batch(self):
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 99},
+                {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 12)
+
+    def test_quantity_restored_by_movements_still_confirms(self):
+        self.app.movement("PAPER", -2, "OUT-P")
+        self.app.movement("PAPER", 2, "IN-P2")
+        result = self.app.confirm_location_counts("A1", self.rows())
+        self.assertEqual([(row["before"], row["difference"]) for row in result], [(12, -4), (3, 0)])
+
+    def test_profile_minimum_and_status_changes_do_not_block(self):
+        self.app.update_material("PAPER", "牛皮纸", "张")
+        self.app.set_minimum("PAPER", 10)
+        self.app.set_active("PAPER", False)
+        result = self.app.confirm_location_counts("A1", self.rows())
+        self.assertEqual(result[0]["difference"], -4)
+
+    def test_invalid_rows_shape_and_values_rejected(self):
+        for location, rows in (
+            (None, self.rows()),
+            (1, self.rows()),
+            ("A1", None),
+            ("A1", []),
+            ("A1", "rows"),
+            ("A1", [["not-an-object"]]),
+            ("A1", [{"code": "PAPER", "counted": 8, "reference": "CNT-P"}]),
+            ("A1", [{"code": "PAPER", "counted": 8, "reference": "CNT-P",
+                     "expected_before": 12, "extra": 1}] * 2),
+        ):
+            with self.subTest(location=location, rows=rows):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_location_counts(location, rows)
+        for counted in (-1, True, 1.5, "8", None):
+            with self.subTest(counted=counted):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_location_counts("A1", [
+                        {"code": "PAPER", "counted": counted, "reference": "CNT-X", "expected_before": 12},
+                        {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+                    ])
+        for expected in (-1, True, False, 1.5, "12", None):
+            with self.subTest(expected_before=expected):
+                with self.assertRaises(ValueError):
+                    self.app.confirm_location_counts("A1", [
+                        {"code": "PAPER", "counted": 8, "reference": "CNT-X", "expected_before": expected},
+                        {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+                    ])
+
+    def test_unknown_material_duplicates_and_reference_conflicts_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "GHOST", "counted": 1, "reference": "CNT-X", "expected_before": 0},
+                {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+            ])
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+                {"code": " PAPER ", "counted": 7, "reference": "CNT-2", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": "CNT-3", "expected_before": 3},
+            ])
+        # References must be unique within the batch.
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": " CNT-1 ", "expected_before": 3},
+            ])
+        # Existing movement, count and reversal references all conflict.
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "IN-P", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+            ])
+        self.app.count("EMPTY", 0, "CNT-ZERO")
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+                {"code": "BOX", "counted": 3, "reference": "CNT-ZERO", "expected_before": 3},
+            ])
+
+    def test_rejection_keeps_file_bytes_and_missing_file_not_created(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 0},
+            ])
+        self.assertFalse((empty / "data.json").exists())
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 99},
+                {"code": "BOX", "counted": 3, "reference": "CNT-2", "expected_before": 3},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.counts("PAPER"), [])
+        self.assertEqual(self.app.counts("BOX"), [])
+
+    def test_locations_history_and_purchases_are_not_rewritten(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 5}])
+        before_locations = self.app.location_changes("PAPER")
+        self.app.confirm_location_counts("A1", self.rows())
+        self.assertEqual(self.app.location_changes("PAPER"), before_locations)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("A1")], ["BOX", "PAPER"])
+        order = self.app.purchase_order("PO-1")
+        self.assertEqual(order["status"], "open")
+        self.assertEqual(order["rows"][0]["quantity"], 5)
+
+    def test_confirmed_location_counts_lock_unit_and_cannot_be_reversed(self):
+        self.app.confirm_location_counts("A1", self.rows())
+        with self.assertRaises(ValueError):
+            self.app.update_material("PAPER", "包装纸", "箱")
+        with self.assertRaises(ValueError):
+            self.app.reverse("CNT-P", "REV-1")
+
+    def test_failed_references_are_reusable_after_fix(self):
+        with self.assertRaises(ValueError):
+            self.app.confirm_location_counts("A1", [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 99},
+                {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+            ])
+        result = self.app.confirm_location_counts("A1", [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-P", "expected_before": 12},
+            {"code": "BOX", "counted": 3, "reference": "CNT-B", "expected_before": 3},
+        ])
+        self.assertEqual([row["reference"] for row in result], ["CNT-P", "CNT-B"])
+
+    def test_legacy_data_without_locations_counts_as_unassigned(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(
+            json.dumps({"materials": {"PAPER": {"code": "PAPER", "name": "包装纸", "unit": "张"}}}),
+            encoding="utf-8")
+        app = StockRoom(legacy)
+        result = app.confirm_location_counts("", [
+            {"code": "PAPER", "counted": 5, "reference": "CNT-P", "expected_before": 0},
+        ])
+        self.assertEqual((result[0]["before"], result[0]["difference"]), (0, 5))
+
+    def test_cli_success_failure_and_array_independence(self):
+        payload = self.write_payload("confirm.json", {"location": "A1", "rows": self.rows()})
+        result = self.run_cli("confirm-location-counts", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual([(row["before"], row["difference"]) for row in output], [(12, -4), (3, 0)])
+        # Failure: error JSON on stderr, exit code 2, ledger untouched.
+        self.app.assign_locations([{"code": "PAPER", "location": "B2"}])
+        self.app.assign_locations([{"code": "BOX", "location": "B2"}])
+        before = self.app.path.read_bytes()
+        bad = self.write_payload("bad.json", {"location": "A1", "rows": [
+            {"code": "PAPER", "counted": 8, "reference": "CNT-X", "expected_before": 8},
+        ]})
+        failed = self.run_cli("confirm-location-counts", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # JSON array: each item commits independently, later failure keeps earlier success.
+        self.app.assign_locations([{"code": "PAPER", "location": "A2"}])
+        batch = self.write_payload("confirms.json", [
+            {"location": "A2", "rows": [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-1", "expected_before": 8}]},
+            {"location": "A2", "rows": [
+                {"code": "PAPER", "counted": 8, "reference": "CNT-2", "expected_before": 99}]},
+        ])
+        mixed = self.run_cli("confirm-location-counts", batch)
+        self.assertEqual(mixed.returncode, 2)
+        self.assertIn("error", json.loads(mixed.stderr))
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 8)
+        self.assertEqual(len(self.app.counts("PAPER")), 2)
+        self.assertEqual(self.app.stock("BOX")["quantity"], 3)
+        self.assertEqual(len(self.app.counts("BOX")), 1)
+
+
 class ImportMovementsCsvTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

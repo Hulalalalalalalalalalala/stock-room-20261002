@@ -446,6 +446,23 @@ class StockRoom(JsonStore):
         self._write(data)
         return [dict(record) for record in parsed]
 
+    def confirm_location_counts(self, location, rows):
+        if not isinstance(location, str):
+            raise ValueError("location must be a string")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        location = location.strip()
+        data = self._read()
+        parsed = self._plan_confirmed_location_counts(data, location, rows)
+        counts = data.setdefault("counts", [])
+        movements = data.setdefault("movements", [])
+        for record in parsed:
+            counts.append(dict(record))
+            if record["difference"] != 0:
+                movements.append({"code": record["code"], "quantity": record["difference"], "reference": record["reference"]})
+        self._write(data)
+        return [dict(record) for record in parsed]
+
     def preview_counts(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
@@ -533,6 +550,57 @@ class StockRoom(JsonStore):
             seen_references.add(reference)
             parsed.append({"code": code, "reference": reference, "before": before, "counted": counted,
                            "difference": counted - before})
+        return parsed
+
+    def _plan_confirmed_location_counts(self, data, location, rows):
+        # Whole-location counterpart of _plan_confirmed_counts: rows keep the
+        # exact structure, field validation and unique reference rules of a
+        # confirmed count, and every expected_before is checked against the
+        # current ledger. Beyond that, the rows must name exactly the
+        # materials currently assigned to the location (inactive and
+        # zero-stock materials included, each exactly once): a material from
+        # another location, a missing material or an empty location all
+        # reject the batch. The location itself is only compared for
+        # assignment and never rewritten. Nothing is written here; the
+        # caller commits the plan atomically.
+        materials = data.get("materials", {})
+        locations = data.get("locations", {})
+        existing = data.get("movements", [])
+        located = {code for code in materials if locations.get(code, "") == location}
+        if not located:
+            raise ValueError("location has no materials")
+        parsed = []
+        seen_codes = set()
+        seen_references = set()
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "counted", "reference", "expected_before"}:
+                raise ValueError("each row must be an object with code, counted, reference and expected_before")
+            code = text(entry["code"], "code")
+            reference = text(entry["reference"], "reference")
+            counted = entry["counted"]
+            if type(counted) is not int or counted < 0:
+                raise ValueError("counted must be a nonnegative integer")
+            expected_before = entry["expected_before"]
+            if type(expected_before) is not int or expected_before < 0:
+                raise ValueError("expected_before must be a nonnegative integer")
+            if code not in materials:
+                raise ValueError("unknown material")
+            if code in seen_codes:
+                raise ValueError("material already exists in batch")
+            if code not in located:
+                raise ValueError("material is not assigned to this location")
+            if reference in seen_references:
+                raise ValueError("reference already exists")
+            self._require_unique_reference(data, reference)
+            before = sum(row["quantity"] for row in existing if row["code"] == code)
+            if before != expected_before:
+                raise ValueError("stock does not match the confirmed quantity")
+            seen_codes.add(code)
+            seen_references.add(reference)
+            parsed.append({"code": code, "reference": reference, "before": before, "counted": counted,
+                           "difference": counted - before})
+        if seen_codes != located:
+            raise ValueError("location count must cover every material at the location")
         return parsed
 
     def counts(self, code):
