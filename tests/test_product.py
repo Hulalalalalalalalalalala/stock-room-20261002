@@ -6482,3 +6482,211 @@ class SupplierLedgerTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
+
+
+class LocationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        self.app.movement("PAPER", 12, "IN-1")
+
+    def test_fixed_sample_assign_move_cancel(self):
+        self.seed_fixed_sample()
+        result = self.app.assign_locations([
+            {"code": " PAPER ", "location": " A-01 "},
+            {"code": "BOX", "location": "A-01"},
+        ])
+        self.assertEqual(result, [
+            {"code": "PAPER", "before": "", "location": "A-01"},
+            {"code": "BOX", "before": "", "location": "A-01"},
+        ])
+        self.assertEqual(self.app.assign_locations([{"code": "PAPER", "location": "B-02"}]),
+                         [{"code": "PAPER", "before": "A-01", "location": "B-02"}])
+        self.assertEqual(self.app.assign_locations([{"code": "BOX", "location": "  "}]),
+                         [{"code": "BOX", "before": "A-01", "location": ""}])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        self.assertEqual(reopened.stock("BOX")["quantity"], 0)
+        self.assertEqual(reopened.location_changes("PAPER"), [
+            {"code": "PAPER", "sequence": 1, "before": "", "after": "A-01"},
+            {"code": "PAPER", "sequence": 2, "before": "A-01", "after": "B-02"},
+        ])
+        self.assertEqual(reopened.location_changes("BOX"), [
+            {"code": "BOX", "sequence": 1, "before": "", "after": "A-01"},
+            {"code": "BOX", "sequence": 2, "before": "A-01", "after": ""},
+        ])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("A-01")], [])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("B-02")], ["PAPER"])
+        self.assertEqual([item["code"] for item in reopened.location_inventory("")], ["BOX"])
+
+    def test_repeat_assign_is_noop_and_writes_nothing(self):
+        self.app.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        before = self.app.path.read_bytes()
+        result = self.app.assign_locations([{"code": "PAPER", "location": " A-01 "}])
+        self.assertEqual(result, [{"code": "PAPER", "before": "A-01", "location": "A-01"}])
+        self.assertEqual(self.app.assign_locations([{"code": "BOX", "location": ""}]),
+                         [{"code": "BOX", "before": "", "location": ""}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(len(self.app.location_changes("PAPER")), 1)
+
+    def test_mixed_batch_writes_only_actual_changes(self):
+        self.app.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        result = self.app.assign_locations([
+            {"code": "PAPER", "location": "A-01"},
+            {"code": "BOX", "location": "A-01"},
+        ])
+        self.assertEqual([row["before"] for row in result], ["A-01", ""])
+        self.assertEqual(len(self.app.location_changes("PAPER")), 1)
+        self.assertEqual(len(self.app.location_changes("BOX")), 1)
+
+    def test_invalid_batches_rejected_and_file_preserved(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        bad_rows = [
+            None,
+            [],
+            "PAPER",
+            [{"code": "PAPER"}],
+            [{"code": "PAPER", "location": "A-01", "extra": 1}],
+            ["PAPER"],
+            [{"code": "", "location": "A-01"}],
+            [{"code": "  ", "location": "A-01"}],
+            [{"code": 1, "location": "A-01"}],
+            [{"code": "PAPER", "location": 1}],
+            [{"code": "PAPER", "location": None}],
+            [{"code": "GHOST", "location": "A-01"}],
+            [{"code": "PAPER", "location": "A-01"}, {"code": " PAPER", "location": "B-02"}],
+        ]
+        for rows in bad_rows:
+            with self.assertRaises(ValueError, msg=repr(rows)):
+                self.app.assign_locations(rows)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([item["code"] for item in self.app.location_inventory("")], ["BOX", "PAPER"])
+
+    def test_failure_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        with self.assertRaises(ValueError):
+            app.location_changes("PAPER")
+        self.assertEqual(app.location_inventory("A-01"), [])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_location_inventory_fields_and_sorting(self):
+        self.app.register("Ä", "特殊", "件")
+        self.app.register("A-2", "二号", "件")
+        self.app.movement("PAPER", 5, "IN-1")
+        self.app.set_minimum("PAPER", 3)
+        self.app.set_active("BOX", False)
+        self.app.assign_locations([
+            {"code": "PAPER", "location": "A-01"},
+            {"code": "BOX", "location": "A-01"},
+            {"code": "Ä", "location": "A-01"},
+            {"code": "A-2", "location": "A-01"},
+        ])
+        items = self.app.location_inventory(" A-01 ")
+        self.assertEqual([item["code"] for item in items], ["A-2", "BOX", "PAPER", "Ä"])
+        paper = next(item for item in items if item["code"] == "PAPER")
+        self.assertEqual(paper, {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 5,
+                                 "minimum": 3, "active": True, "location": "A-01"})
+        box = next(item for item in items if item["code"] == "BOX")
+        self.assertEqual(box["active"], False)
+        self.assertEqual(box["quantity"], 0)
+        self.assertEqual(self.app.location_inventory("a-01"), [])
+        with self.assertRaises(ValueError):
+            self.app.location_inventory(None)
+        with self.assertRaises(ValueError):
+            self.app.location_inventory(1)
+
+    def test_location_changes_validation_and_empty_history(self):
+        self.assertEqual(self.app.location_changes("PAPER"), [])
+        for code in ("", "  ", None, 1, "GHOST"):
+            with self.assertRaises(ValueError, msg=repr(code)):
+                self.app.location_changes(code)
+        self.app.set_active("BOX", False)
+        self.assertEqual(self.app.location_changes("BOX"), [])
+
+    def test_assignment_has_no_business_side_effects(self):
+        self.seed_fixed_sample()
+        self.app.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.history("PAPER"), [{"code": "PAPER", "quantity": 12, "reference": "IN-1"}])
+        self.assertEqual(reopened.material_changes("PAPER"), [])
+        self.assertEqual(reopened.stock("PAPER")["quantity"], 12)
+        inventory = reopened.inventory()
+        self.assertEqual([set(item) for item in inventory],
+                         [{"code", "name", "unit", "quantity", "minimum", "active"}] * 2)
+        self.assertEqual(reopened.export_inventory_csv().splitlines()[0], HEADER)
+        # 归位历史不锁定单位变更（无流水之外的锁定来源；此处有流水故仍锁定）。
+        self.app.register("EMPTY", "空料", "件")
+        self.app.assign_locations([{"code": "EMPTY", "location": "Z-9"}])
+        updated = self.app.update_material("EMPTY", "空料", "箱")
+        self.assertEqual(updated["unit"], "箱")
+
+    def test_queries_are_read_only(self):
+        self.seed_fixed_sample()
+        self.app.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        before = self.app.path.read_bytes()
+        self.app.location_inventory("A-01")
+        self.app.location_inventory("")
+        self.app.location_changes("PAPER")
+        with self.assertRaises(ValueError):
+            self.app.location_inventory(None)
+        with self.assertRaises(ValueError):
+            self.app.location_changes("GHOST")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_legacy_data_treated_as_unassigned(self):
+        self.seed_fixed_sample()
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("locations", None)
+        data.pop("location_changes", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        reopened = StockRoom(self.root)
+        self.assertEqual([item["code"] for item in reopened.location_inventory("")], ["BOX", "PAPER"])
+        self.assertEqual(reopened.location_changes("PAPER"), [])
+        result = reopened.assign_locations([{"code": "PAPER", "location": "A-01"}])
+        self.assertEqual(result, [{"code": "PAPER", "before": "", "location": "A-01"}])
+        self.assertEqual(reopened.location_changes("PAPER"),
+                         [{"code": "PAPER", "sequence": 1, "before": "", "after": "A-01"}])
+
+    def test_cli_object_and_array_success_and_failure(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("assign.json", {"rows": [
+            {"code": "PAPER", "location": "A-01"},
+            {"code": "BOX", "location": "A-01"},
+        ]})
+        result = self.run_cli("assign-locations", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([row["location"] for row in json.loads(result.stdout)], ["A-01", "A-01"])
+        query = self.write_payload("query.json", {"location": "A-01"})
+        result = self.run_cli("location-inventory", query)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["code"] for item in json.loads(result.stdout)], ["BOX", "PAPER"])
+        array_payload = self.write_payload("changes.json", [{"code": "PAPER"}, {"code": "BOX"}])
+        result = self.run_cli("location-changes", array_payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual([len(rows) for rows in values], [1, 1])
+        bad = self.write_payload("bad.json", {"rows": [{"code": "GHOST", "location": "A-01"}]})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("assign-locations", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)

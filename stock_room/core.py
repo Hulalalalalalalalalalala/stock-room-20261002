@@ -1800,6 +1800,90 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def assign_locations(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("rows must be a nonempty list")
+        data = self._read()
+        materials = data.get("materials", {})
+        locations = data.get("locations", {})
+        seen = set()
+        planned = []
+        for entry in rows:
+            if not isinstance(entry, dict) or set(entry) != {"code", "location"}:
+                raise ValueError("each row must be an object with code and location")
+            code = text(entry["code"], "code")
+            location = entry["location"]
+            if not isinstance(location, str):
+                raise ValueError("location must be a string")
+            location = location.strip()
+            if code not in materials:
+                raise ValueError("unknown material")
+            if code in seen:
+                raise ValueError("material already exists in batch")
+            seen.add(code)
+            planned.append({"code": code, "before": locations.get(code, ""), "location": location})
+        if any(row["before"] != row["location"] for row in planned):
+            updated = data.setdefault("locations", {})
+            histories = data.setdefault("location_changes", {})
+            for row in planned:
+                if row["before"] == row["location"]:
+                    continue
+                code = row["code"]
+                if row["location"]:
+                    updated[code] = row["location"]
+                else:
+                    updated.pop(code, None)
+                records = histories.setdefault(code, [])
+                records.append({
+                    "code": code,
+                    "sequence": len(records) + 1,
+                    "before": row["before"],
+                    "after": row["location"],
+                })
+            self._write(data)
+        return planned
+
+    def location_inventory(self, location):
+        if not isinstance(location, str):
+            raise ValueError("location must be a string")
+        location = location.strip()
+        data = self._read()
+        rows = data.get("movements", [])
+        minimums = data.get("minimums", {})
+        status = data.get("status", {})
+        locations = data.get("locations", {})
+        items = []
+        for code, material in data.get("materials", {}).items():
+            if locations.get(code, "") != location:
+                continue
+            quantity = sum(row["quantity"] for row in rows if row["code"] == code)
+            items.append({
+                "code": code,
+                "name": material["name"],
+                "unit": material["unit"],
+                "quantity": quantity,
+                "minimum": minimums.get(code, 0),
+                "active": status.get(code, True),
+                "location": location,
+            })
+        items.sort(key=lambda item: item["code"])
+        return items
+
+    def location_changes(self, code):
+        code = text(code, "code")
+        data = self._read()
+        if code not in data.get("materials", {}):
+            raise ValueError("unknown material")
+        return [
+            {
+                "code": row["code"],
+                "sequence": row["sequence"],
+                "before": row["before"],
+                "after": row["after"],
+            }
+            for row in data.get("location_changes", {}).get(code, [])
+        ]
+
     @staticmethod
     def _require_unique_reference(data, reference):
         if any(row["reference"] == reference for row in data.get("movements", [])):
