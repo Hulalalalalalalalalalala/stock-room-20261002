@@ -3158,6 +3158,263 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual(StockRoom(self.root).purchase_order("PO-1")["status"], "open")
 
 
+class ReopenPurchasesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body), encoding="utf-8")
+        return str(payload)
+
+    def test_fixed_scenario_receive_return_cancel_reopen_then_complete(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 2, "RET-1")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 4)
+        self.app.cancel_purchase("PO-1")
+        result = self.app.reopen_purchases([" PO-1 "])
+        self.assertEqual(result, [{
+            "reference": "PO-1",
+            "supplier": "供应商",
+            "status": "open",
+            "rows": [{"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 10}],
+        }])
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 4)
+        progress = self.app.purchase_progress("PO-1")
+        self.assertEqual(progress["rows"][0]["received"], 6)
+        self.assertEqual(progress["rows"][0]["returned"], 2)
+        self.assertEqual(progress["rows"][0]["remaining"], 4)
+        # 退货不恢复额度：只能再收四张
+        with self.assertRaises(ValueError):
+            self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 5, "reference": "RCV-2"}])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 4, "reference": "RCV-2"}])
+        self.assertEqual(self.app.purchase_progress("PO-1")["progress"], "complete")
+        self.assertEqual(self.app.stock("PAPER")["quantity"], 8)
+        reopened = StockRoom(self.root)
+        self.assertEqual(reopened.purchase_order("PO-1")["status"], "open")
+        self.assertEqual(reopened.purchase_progress("PO-1")["progress"], "complete")
+
+    def test_invalid_references_rejected(self):
+        before = self.app.path.read_bytes()
+        for body in ([], "PO-1", {"reference": "PO-1"}, 5, None,
+                     ["PO-1", 3],
+                     ["PO-1", "  "],
+                     ["PO-1", ""],
+                     [" PO-1 ", "PO-1"]):
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    self.app.reopen_purchases(body)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_unknown_reference_rejected_and_case_sensitive_exact_match(self):
+        self.app.create_purchase("PO 1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.cancel_purchase("PO 1")
+        before = self.app.path.read_bytes()
+        for body in (["MISSING"], ["po 1"], ["PO  1"], ["PAPER"]):
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    self.app.reopen_purchases(body)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # 内部空白保留，精确匹配成功
+        self.assertEqual(self.app.reopen_purchases(["PO 1"])[0]["status"], "open")
+
+    def test_cancelled_order_without_outstanding_lines_rejected(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 3}])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-1"}])
+        self.app.cancel_purchase("PO-1")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reopen_purchases(["PO-1"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.purchase_order("PO-1")["status"], "cancelled")
+
+    def test_outstanding_material_missing_inactive_or_unit_mismatch_rejected(self):
+        # 物料已删除
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.cancel_purchase("PO-1")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        del data["materials"]["PAPER"]
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).reopen_purchases(["PO-1"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # 物料已停用
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["materials"]["PAPER"] = {"code": "PAPER", "name": "包装纸", "unit": "张"}
+        data["status"] = {"PAPER": False}
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).reopen_purchases(["PO-1"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # 单位与快照不一致
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["materials"]["PAPER"]["unit"] = "包"
+        data["status"] = {}
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).reopen_purchases(["PO-1"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_fully_received_line_does_not_block_even_if_inactive_or_renamed(self):
+        self.app.create_purchase("PO-1", "供应商", [
+            {"code": "PAPER", "quantity": 3},
+            {"code": "BOX", "quantity": 2},
+        ])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-1"}])
+        self.app.cancel_purchase("PO-1")
+        self.app.set_active("PAPER", False)
+        result = self.app.reopen_purchases(["PO-1"])
+        self.assertEqual(result[0]["status"], "open")
+        self.assertEqual(result[0]["rows"][0]["name"], "包装纸")
+
+    def test_open_orders_pass_without_condition_checks(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 1}])
+        self.app.cancel_purchase("PO-2")
+        self.app.set_active("PAPER", False)
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        del data["materials"]["BOX"]
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        # PO-1 是 open：物料停用也原样返回；PO-2 物料已删除故整批失败
+        with self.assertRaises(ValueError):
+            StockRoom(self.root).reopen_purchases(["PO-1", "PO-2"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_batch_rejected_atomically_when_any_order_fails(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 2, "RET-1")
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 4}])
+        self.app.cancel_purchase("PO-1")
+        self.app.cancel_purchase("PO-2")
+        self.app.set_active("BOX", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reopen_purchases(["PO-1", "PO-2"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        app = StockRoom(self.root)
+        self.assertEqual(app.purchase_order("PO-1")["status"], "cancelled")
+        self.assertEqual(app.purchase_order("PO-2")["status"], "cancelled")
+        self.assertEqual(app.stock("PAPER")["quantity"], 4)
+        self.assertEqual(app.purchase_changes("PO-1")[-1]["action"], "cancel_purchase")
+        self.assertEqual(app.purchase_changes("PO-2")[-1]["action"], "cancel_purchase")
+
+    def test_mixed_open_and_cancelled_batch_only_reopens_cancelled(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 2}])
+        self.app.cancel_purchase("PO-2")
+        result = self.app.reopen_purchases(["PO-2", "PO-1"])
+        self.assertEqual([order["reference"] for order in result], ["PO-2", "PO-1"])
+        self.assertEqual([order["status"] for order in result], ["open", "open"])
+        changes_1 = self.app.purchase_changes("PO-1")
+        changes_2 = self.app.purchase_changes("PO-2")
+        self.assertEqual(changes_1, [])
+        self.assertEqual([row["action"] for row in changes_2], ["cancel_purchase", "reopen_purchases"])
+        reopen = changes_2[-1]
+        self.assertEqual(reopen["sequence"], 2)
+        self.assertEqual(reopen["before"]["status"], "cancelled")
+        self.assertEqual(reopen["after"]["status"], "open")
+        self.assertEqual(reopen["before"]["rows"], reopen["after"]["rows"])
+        self.assertEqual(reopen["before"]["supplier"], reopen["after"]["supplier"])
+
+    def test_all_open_batch_does_not_write_or_add_history(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 1}])
+        before = self.app.path.read_bytes()
+        result = self.app.reopen_purchases([" PO-2 ", "PO-1"])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual([order["reference"] for order in result], ["PO-2", "PO-1"])
+        self.assertEqual(self.app.purchase_changes("PO-1"), [])
+        self.assertEqual(self.app.purchase_changes("PO-2"), [])
+
+    def test_failure_creates_no_file(self):
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.reopen_purchases(["PO-1"])
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_missing_receipts_and_status_defaults(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 2}])
+        self.app.cancel_purchase("PO-1")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchase_receipts", None)
+        data.pop("status", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = StockRoom(self.root).reopen_purchases(["PO-1"])
+        self.assertEqual(result[0]["status"], "open")
+
+    def test_reopened_order_counts_in_supplier_outstanding_and_replenishment(self):
+        self.app.set_minimum("PAPER", 10)
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 10}])
+        self.app.cancel_purchase("PO-1")
+        self.assertEqual(self.app.supplier_outstanding("供应商"), [])
+        plan = {item["code"]: item for item in self.app.replenishment_plan()}
+        self.assertEqual(plan["PAPER"]["incoming"], 0)
+        self.assertEqual(plan["PAPER"]["suggested"], 10)
+        self.app.reopen_purchases(["PO-1"])
+        outstanding = self.app.supplier_outstanding("供应商")
+        self.assertEqual(len(outstanding), 1)
+        self.assertEqual(outstanding[0]["code"], "PAPER")
+        self.assertEqual(outstanding[0]["remaining"], 10)
+        plan = {item["code"]: item for item in self.app.replenishment_plan()}
+        self.assertEqual(plan["PAPER"]["incoming"], 10)
+        self.assertEqual(plan["PAPER"]["suggested"], 0)
+        orders = self.app.purchase_orders(status="open")
+        self.assertEqual([order["reference"] for order in orders], ["PO-1"])
+        self.assertIn("open", self.app.export_purchases_csv())
+
+    def test_reopen_persists_across_reopen_with_single_history_record(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 1}])
+        self.app.cancel_purchase("PO-1")
+        self.app.reopen_purchases(["PO-1"])
+        app = StockRoom(self.root)
+        self.assertEqual(app.purchase_order("PO-1")["status"], "open")
+        actions = [row["action"] for row in app.purchase_changes("PO-1")]
+        self.assertEqual(actions, ["cancel_purchase", "reopen_purchases"])
+
+    def test_cli_reopen_success_failure_and_array_partial_commit(self):
+        self.app.create_purchase("PO-1", "供应商", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("PO-1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-1", 2, "RET-1")
+        self.app.create_purchase("PO-2", "供应商", [{"code": "BOX", "quantity": 4}])
+        self.app.cancel_purchase("PO-1")
+        self.app.cancel_purchase("PO-2")
+        payload = self.write_payload("reopen.json", {"references": [" PO-1 "]})
+        result = self.run_cli("reopen-purchases", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([order["reference"] for order in value], ["PO-1"])
+        self.assertEqual(value[0]["status"], "open")
+        bad = self.write_payload("bad.json", {"references": ["PO-2", "MISSING"]})
+        result = self.run_cli("reopen-purchases", bad)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(StockRoom(self.root).purchase_order("PO-2")["status"], "cancelled")
+        # JSON 数组逐项独立提交：第一项恢复 PO-2，第二项失败不回滚
+        array_payload = self.write_payload("array.json", [
+            {"references": ["PO-2"]},
+            {"references": ["MISSING"]},
+        ])
+        result = self.run_cli("reopen-purchases", array_payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(StockRoom(self.root).purchase_order("PO-2")["status"], "open")
+
+
 class ReplenishmentPurchaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

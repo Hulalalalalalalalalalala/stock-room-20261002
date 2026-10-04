@@ -939,6 +939,70 @@ class StockRoom(JsonStore):
             self._write(data)
         return self._purchase_snapshot(order)
 
+    def reopen_purchases(self, references):
+        # Batch counterpart of cancel_purchase: reopen the listed cancelled
+        # orders so their outstanding lines can receive again. References are
+        # stripped (inner whitespace is kept) and matched exactly, case
+        # sensitively. Already-open orders pass through without any reopen
+        # condition checks. A cancelled order must have at least one line
+        # whose ordered quantity exceeds the accumulated linked receipts
+        # (returns never restore the quota), and exactly those outstanding
+        # lines must still reference an existing, currently enabled material
+        # whose unit equals the purchase snapshot; fully received lines do
+        # not block the reopen. The whole request is validated against the
+        # pre-batch data before anything flips.
+        if not isinstance(references, list) or not references:
+            raise ValueError("references must be a nonempty list")
+        normalized = []
+        seen = set()
+        for entry in references:
+            if not isinstance(entry, str):
+                raise ValueError("each reference must be a string")
+            reference = entry.strip()
+            if not reference:
+                raise ValueError("reference must be a nonempty string")
+            if reference in seen:
+                raise ValueError("reference already exists in batch")
+            seen.add(reference)
+            normalized.append(reference)
+        data = self._read()
+        orders = {order["reference"]: order for order in data.get("purchases", [])}
+        materials = data.get("materials", {})
+        status = data.get("status", {})
+        reopening = []
+        for reference in normalized:
+            order = orders.get(reference)
+            if order is None:
+                raise ValueError("unknown purchase reference")
+            if order.get("status") == "open":
+                continue
+            received = self._received_totals(data, reference)
+            outstanding = [
+                line for line in order.get("rows", [])
+                if line["quantity"] - received.get(line["code"], 0) > 0
+            ]
+            if not outstanding:
+                raise ValueError("purchase has no outstanding lines")
+            for line in outstanding:
+                code = line["code"]
+                material = materials.get(code)
+                if material is None:
+                    raise ValueError("unknown material")
+                if not status.get(code, True):
+                    raise ValueError("material is inactive")
+                if material["unit"] != line["unit"]:
+                    raise ValueError("material unit differs from the purchase snapshot")
+            reopening.append(order)
+        if not reopening:
+            # All references pointed at open orders: succeed as a pure query.
+            return [self._purchase_snapshot(orders[reference]) for reference in normalized]
+        for order in reopening:
+            before = self._purchase_snapshot(order)
+            order["status"] = "open"
+            self._record_purchase_change(data, order, "reopen_purchases", before)
+        self._write(data)
+        return [self._purchase_snapshot(orders[reference]) for reference in normalized]
+
     def update_purchase(self, reference, supplier, rows):
         reference = text(reference, "reference")
         supplier = text(supplier, "supplier")
