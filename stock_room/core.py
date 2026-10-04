@@ -2085,6 +2085,42 @@ class StockRoom(JsonStore):
         items.sort(key=lambda item: item["code"])
         return items
 
+    def import_locations_csv(self, content):
+        # CSV counterpart of assign_locations: the whole document is parsed
+        # and validated first, then committed through the same rules, so a
+        # bad record rejects the entire batch without touching the file.
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        if content.startswith("﻿"):
+            content = content[1:]
+        if not content:
+            raise ValueError("content must be a nonempty CSV document")
+        rows = _parse_csv(content)
+        if not rows:
+            raise ValueError("content must be a nonempty CSV document")
+        header = rows[0]
+        if len(header) != 2 or set(header) != {"code", "location"}:
+            raise ValueError("header must contain exactly the code and location columns")
+        positions = {name: header.index(name) for name in ("code", "location")}
+        entries = []
+        seen = set()
+        for row in rows[1:]:
+            if not row:
+                continue
+            if len(row) != 2:
+                raise ValueError("each record must have exactly two columns")
+            code = row[positions["code"]].strip()
+            location = row[positions["location"]].strip()
+            if not code:
+                raise ValueError("code must be a nonempty string")
+            if code in seen:
+                raise ValueError("material already exists in batch")
+            seen.add(code)
+            entries.append({"code": code, "location": location})
+        if not entries:
+            return []
+        return self.assign_locations(entries)
+
     def assign_locations(self, rows):
         if not isinstance(rows, list) or not rows:
             raise ValueError("rows must be a nonempty list")
