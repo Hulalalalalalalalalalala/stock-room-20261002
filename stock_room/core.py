@@ -339,6 +339,67 @@ class StockRoom(JsonStore):
             before = balance
         return entries
 
+    def stock_summary(self, start_reference=None, end_reference=None, keyword=""):
+        # Read-only receipts/issues summary over the whole-ledger interval
+        # defined by two movement references. The interval endpoints are
+        # located by movements registration order (never by reference
+        # sorting) and are inclusive; a null endpoint means the very first
+        # or last movement. Validation runs even when the keyword matches
+        # nothing, so bad boundaries are still reported.
+        if start_reference is not None:
+            start_reference = text(start_reference, "start_reference")
+        if end_reference is not None:
+            end_reference = text(end_reference, "end_reference")
+        if not isinstance(keyword, str):
+            raise ValueError("keyword must be a string")
+        keyword = keyword.strip()
+        data = self._read()
+        movements = data.get("movements", [])
+        if start_reference is not None or end_reference is not None:
+            positions = {}
+            for index, row in enumerate(movements):
+                positions.setdefault(row["reference"], index)
+            if start_reference is not None and start_reference not in positions:
+                raise ValueError("unknown start reference")
+            if end_reference is not None and end_reference not in positions:
+                raise ValueError("unknown end reference")
+            start_index = positions[start_reference] if start_reference is not None else 0
+            end_index = positions[end_reference] if end_reference is not None else len(movements) - 1
+            if start_index > end_index:
+                raise ValueError("start reference must not come after end reference")
+        else:
+            start_index, end_index = 0, len(movements) - 1
+        materials = data.get("materials", {})
+        totals = {code: [0, 0, 0] for code in materials}
+        for index, row in enumerate(movements):
+            code = row["code"]
+            if code not in totals:
+                continue
+            quantity = row["quantity"]
+            if index < start_index:
+                totals[code][0] += quantity
+            elif index <= end_index:
+                if quantity > 0:
+                    totals[code][1] += quantity
+                else:
+                    totals[code][2] -= quantity
+        items = []
+        for code, material in materials.items():
+            if keyword and keyword not in code and keyword not in material["name"]:
+                continue
+            opening, incoming, outgoing = totals[code]
+            items.append({
+                "code": code,
+                "name": material["name"],
+                "unit": material["unit"],
+                "opening": opening,
+                "incoming": incoming,
+                "outgoing": outgoing,
+                "closing": opening + incoming - outgoing,
+            })
+        items.sort(key=lambda item: item["code"])
+        return items
+
     def count(self, code, counted, reference):
         code, reference = text(code, "code"), text(reference, "reference")
         if type(counted) is not int or counted < 0:
