@@ -1307,6 +1307,45 @@ class StockRoom(JsonStore):
         purchases.sort(key=lambda item: item["reference"])
         return {**record, "purchases": purchases}
 
+    def supplier_outstanding(self, supplier):
+        if not isinstance(supplier, str):
+            raise ValueError("supplier must be a nonempty string")
+        supplier = supplier.strip()
+        if not supplier:
+            raise ValueError("supplier must be a nonempty string")
+        data = self._read()
+        known = supplier in data.get("suppliers", {}) or any(
+            order["supplier"] == supplier for order in data.get("purchases", [])
+        )
+        if not known:
+            raise ValueError("unknown supplier")
+        groups = {}
+        for order in data.get("purchases", []):
+            if order["supplier"] != supplier or order.get("status") != "open":
+                continue
+            received = self._received_totals(data, order["reference"])
+            for line in order.get("rows", []):
+                remaining = line["quantity"] - received.get(line["code"], 0)
+                if remaining <= 0:
+                    continue
+                key = (line["code"], line["unit"])
+                groups.setdefault(key, []).append({
+                    "reference": order["reference"],
+                    "name": line["name"],
+                    "remaining": remaining,
+                })
+        items = []
+        for (code, unit), purchases in groups.items():
+            purchases.sort(key=lambda item: item["reference"])
+            items.append({
+                "code": code,
+                "unit": unit,
+                "remaining": sum(item["remaining"] for item in purchases),
+                "purchases": purchases,
+            })
+        items.sort(key=lambda item: (item["code"], item["unit"]))
+        return items
+
     def supplier_changes(self, supplier):
         supplier = text(supplier, "supplier")
         data = self._read()
