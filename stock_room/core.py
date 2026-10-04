@@ -1788,6 +1788,51 @@ class StockRoom(JsonStore):
         self._write(data)
         return self.supplier_record(target)
 
+    def rename_supplier(self, source, target):
+        # Give an existing supplier a name that currently belongs to no
+        # supplier. Existence uses the same union as the supplier list (a
+        # contact profile or a purchase), while the target may be a name that
+        # only survives in history. All of the source's purchases move with
+        # only their supplier field changed; an existing profile moves with
+        # its contact fields verbatim. Everything is validated before the
+        # single write, so a rejection leaves the file untouched.
+        source = text(source, "source")
+        target = text(target, "target")
+        data = self._read()
+        profiles = data.get("suppliers", {})
+        orders = data.get("purchases", [])
+
+        def has_supplier(name):
+            if name in profiles:
+                return True
+            return any(order["supplier"] == name for order in orders)
+
+        if source == target:
+            raise ValueError("source and target must be different suppliers")
+        if not has_supplier(source):
+            raise ValueError("unknown supplier")
+        if has_supplier(target):
+            raise ValueError("supplier already exists")
+        source_profile = profiles.get(source)
+        migrated = []
+        for order in orders:
+            if order["supplier"] == source:
+                migrated.append((self._purchase_snapshot(order), order))
+                order["supplier"] = target
+        if source_profile is not None:
+            source_before = self._supplier_snapshot(source_profile, source)
+            moved = dict(source_profile)
+            moved["supplier"] = target
+            profiles[target] = moved
+            profiles.pop(source, None)
+            target_after = self._supplier_snapshot(moved, target)
+            self._record_supplier_change(data, source, "rename_supplier", target, source_before, None)
+            self._record_supplier_change(data, target, "rename_supplier", source, None, target_after)
+        for before, order in migrated:
+            self._record_purchase_change(data, order, "rename_supplier", before)
+        self._write(data)
+        return self.supplier_record(target)
+
     def _purchase_progress(self, data, order):
         purchase_reference = order["reference"]
         received = self._received_totals(data, purchase_reference)
