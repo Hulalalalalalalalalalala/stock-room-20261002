@@ -6303,3 +6303,182 @@ class SupplierOutstandingTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(self.app.path.read_bytes(), before)
+
+
+class SupplierLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = StockRoom(self.root)
+        self.app.register("PAPER", "包装纸", "张")
+        self.app.register("BOX", "纸箱", "个")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "stock_room", "--root", str(self.root), *args],
+                              text=True, capture_output=True)
+
+    def write_payload(self, name, body):
+        payload = self.root / name
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return str(payload)
+
+    def seed_fixed_sample(self):
+        self.app.create_purchase("P2", "甲", [{"code": "PAPER", "quantity": 10}])
+        self.app.create_purchase("P1", "甲", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("P2", [{"code": "PAPER", "quantity": 6, "reference": "RCV-2"}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 3, "reference": "RCV-1"}])
+        self.app.return_purchase("RCV-2", 2, "RET-1")
+
+    def test_fixed_sample_quantities_and_net_received(self):
+        self.seed_fixed_sample()
+        expected = [
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 6, "reference": "RCV-2",
+             "kind": "purchase_receipt", "purchase_reference": "P2", "related_reference": None, "net_received": 6},
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 3, "reference": "RCV-1",
+             "kind": "purchase_receipt", "purchase_reference": "P1", "related_reference": None, "net_received": 9},
+            {"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": -2, "reference": "RET-1",
+             "kind": "purchase_return", "purchase_reference": "P2", "related_reference": "RCV-2", "net_received": 7},
+        ]
+        self.assertEqual(self.app.supplier_ledger("甲"), expected)
+        self.assertEqual(StockRoom(self.root).supplier_ledger(" 甲 "), expected)
+
+    def test_kind_filter_hides_rows_without_recomputing_net(self):
+        self.seed_fixed_sample()
+        rows = self.app.supplier_ledger("甲", kind="purchase_return")
+        self.assertEqual([(row["reference"], row["quantity"], row["net_received"]) for row in rows],
+                         [("RET-1", -2, 7)])
+        rows = self.app.supplier_ledger("甲", kind="purchase_receipt")
+        self.assertEqual([(row["reference"], row["net_received"]) for row in rows],
+                         [("RCV-2", 6), ("RCV-1", 9)])
+        self.assertEqual(self.app.supplier_ledger("甲"), self.app.supplier_ledger("甲", kind=None))
+
+    def test_registration_order_not_purchase_reference_order(self):
+        self.seed_fixed_sample()
+        self.assertEqual([row["purchase_reference"] for row in self.app.supplier_ledger("甲")],
+                         ["P2", "P1", "P2"])
+
+    def test_invalid_arguments_and_unknown_names_rejected(self):
+        self.seed_fixed_sample()
+        for supplier in (None, 123, "", "   ", [], {}):
+            with self.assertRaises(ValueError):
+                self.app.supplier_ledger(supplier)
+        for kind in ("", "receipt", "purchase", "movement", 1, True):
+            with self.assertRaises(ValueError):
+                self.app.supplier_ledger("甲", kind=kind)
+        for name in ("未知", "甲包装", "甲  公司"):
+            with self.assertRaises(ValueError):
+                self.app.supplier_ledger(name)
+        self.app.save_supplier("新名")
+        self.app.merge_supplier("甲", "新名")
+        with self.assertRaises(ValueError):
+            self.app.supplier_ledger("甲")
+        self.assertEqual(len(self.app.supplier_ledger("新名")), 3)
+
+    def test_known_supplier_without_flows_returns_empty_list(self):
+        self.app.save_supplier("仅档案", contact="李")
+        self.assertEqual(self.app.supplier_ledger("仅档案"), [])
+        self.app.create_purchase("P1", "甲", [{"code": "PAPER", "quantity": 5}])
+        self.assertEqual(StockRoom(self.root).supplier_ledger("甲"), [])
+
+    def test_other_flows_excluded_cancelled_and_inactive_included(self):
+        self.app.create_purchase("P1", "甲", [{"code": "PAPER", "quantity": 10}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 6, "reference": "RCV-1"}])
+        self.app.movement("PAPER", 5, "IN-1")
+        self.app.movement("PAPER", -3, "OUT-1")
+        self.app.count("PAPER", 8, "CNT-1")
+        self.app.reverse("IN-1", "REV-1")
+        self.app.create_purchase("P2", "甲", [{"code": "BOX", "quantity": 4}])
+        self.app.receive_purchase("P2", [{"code": "BOX", "quantity": 4, "reference": "RCV-2"}])
+        self.app.cancel_purchase("P2")
+        self.app.set_active("BOX", False)
+        self.app.update_material("PAPER", "新名称", "张")
+        rows = StockRoom(self.root).supplier_ledger("甲")
+        self.assertEqual([(row["reference"], row["kind"]) for row in rows],
+                         [("RCV-1", "purchase_receipt"), ("RCV-2", "purchase_receipt")])
+        self.assertEqual(rows[0]["name"], "包装纸")
+        self.assertEqual(rows[1]["unit"], "个")
+
+    def test_net_received_grouped_by_code_and_unit_snapshot(self):
+        data = {
+            "materials": {"PAPER": {"code": "PAPER", "name": "包装纸", "unit": "包"}},
+            "purchases": [
+                {"reference": "P1", "supplier": "甲", "status": "open",
+                 "rows": [{"code": "PAPER", "name": "包装纸", "unit": "张", "quantity": 10}]},
+                {"reference": "P2", "supplier": "甲", "status": "open",
+                 "rows": [{"code": "PAPER", "name": "包装纸", "unit": "包", "quantity": 5}]},
+            ],
+            "purchase_receipts": {
+                "P1": [{"code": "PAPER", "quantity": 6, "reference": "RCV-1", "balance": 6}],
+                "P2": [{"code": "PAPER", "quantity": 2, "reference": "RCV-2", "balance": 8}],
+            },
+            "movements": [
+                {"code": "PAPER", "quantity": 6, "reference": "RCV-1"},
+                {"code": "PAPER", "quantity": 2, "reference": "RCV-2"},
+            ],
+        }
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        rows = StockRoom(self.root).supplier_ledger("甲")
+        self.assertEqual([(row["unit"], row["net_received"]) for row in rows],
+                         [("张", 6), ("包", 2)])
+
+    def test_merge_moves_records_to_target_only(self):
+        self.seed_fixed_sample()
+        self.app.create_purchase("P9", "甲包装", [{"code": "BOX", "quantity": 3}])
+        self.app.receive_purchase("P9", [{"code": "BOX", "quantity": 3, "reference": "RCV-9"}])
+        self.app.save_supplier("乙")
+        self.app.merge_supplier("甲", "乙")
+        rows = StockRoom(self.root).supplier_ledger("乙")
+        self.assertEqual([row["reference"] for row in rows], ["RCV-2", "RCV-1", "RET-1"])
+        self.assertEqual([row["reference"] for row in self.app.supplier_ledger("甲包装")], ["RCV-9"])
+
+    def test_query_is_read_only_and_creates_no_file(self):
+        self.seed_fixed_sample()
+        before = self.app.path.read_bytes()
+        self.app.supplier_ledger("甲")
+        self.app.supplier_ledger("甲", kind="purchase_return")
+        with self.assertRaises(ValueError):
+            self.app.supplier_ledger("未知")
+        with self.assertRaises(ValueError):
+            self.app.supplier_ledger("甲", kind="bad")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        empty = self.root / "empty"
+        app = StockRoom(empty)
+        with self.assertRaises(ValueError):
+            app.supplier_ledger("甲")
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_legacy_data_missing_links_treated_as_no_records(self):
+        self.app.create_purchase("P1", "甲", [{"code": "PAPER", "quantity": 5}])
+        self.app.receive_purchase("P1", [{"code": "PAPER", "quantity": 2, "reference": "RCV-1"}])
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchase_receipts", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(StockRoom(self.root).supplier_ledger("甲"), [])
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("purchases", None)
+        data["suppliers"] = {"甲": {"supplier": "甲", "contact": "", "phone": "", "note": ""}}
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(StockRoom(self.root).supplier_ledger("甲"), [])
+
+    def test_cli_object_and_array_success_and_failure(self):
+        self.seed_fixed_sample()
+        payload = self.write_payload("ledger.json", {"supplier": "甲"})
+        result = self.run_cli("supplier-ledger", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([(row["quantity"], row["net_received"]) for row in value],
+                         [(6, 6), (3, 9), (-2, 7)])
+        array_payload = self.write_payload("ledger-array.json", [
+            {"supplier": "甲", "kind": "purchase_return"}, {"supplier": "甲"},
+        ])
+        result = self.run_cli("supplier-ledger", array_payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual([len(rows) for rows in values], [1, 3])
+        bad = self.write_payload("bad.json", {"supplier": "未知"})
+        before = self.app.path.read_bytes()
+        failed = self.run_cli("supplier-ledger", bad)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(self.app.path.read_bytes(), before)

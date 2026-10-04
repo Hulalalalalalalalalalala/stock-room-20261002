@@ -1412,6 +1412,65 @@ class StockRoom(JsonStore):
             item["purchases"].sort(key=lambda purchase: purchase["reference"])
         return items
 
+    def supplier_ledger(self, supplier, kind=None):
+        # Read-only receipt/return ledger for one supplier. Entries follow
+        # whole-ledger movement registration order (never purchase reference
+        # sorting); only movements linked to a purchase receipt or return of
+        # an order currently owned by the supplier are included. The running
+        # net_received accumulates per (code, unit snapshot) over every
+        # matching entry, so a kind filter hides rows without recomputing
+        # the cumulative values. Nothing is written here.
+        supplier = text(supplier, "supplier")
+        if kind is not None and kind not in ("purchase_receipt", "purchase_return"):
+            raise ValueError("kind must be purchase_receipt, purchase_return or None")
+        data = self._read()
+        orders = {order["reference"]: order for order in data.get("purchases", [])}
+        if supplier not in data.get("suppliers", {}):
+            if not any(order["supplier"] == supplier for order in orders.values()):
+                raise ValueError("unknown supplier")
+        receipts = {}
+        for purchase_reference, rows in data.get("purchase_receipts", {}).items():
+            for row in rows:
+                receipts[row["reference"]] = purchase_reference
+        returns = {}
+        for purchase_reference, rows in data.get("purchase_returns", {}).items():
+            for row in rows:
+                returns[row["reference"]] = (purchase_reference, row["receipt_reference"])
+        entries = []
+        nets = {}
+        for row in data.get("movements", []):
+            reference = row["reference"]
+            related_reference = None
+            if reference in receipts:
+                entry_kind = "purchase_receipt"
+                purchase_reference = receipts[reference]
+            elif reference in returns:
+                entry_kind = "purchase_return"
+                purchase_reference, related_reference = returns[reference]
+            else:
+                continue
+            order = orders.get(purchase_reference)
+            if order is None or order["supplier"] != supplier:
+                continue
+            line = next((item for item in order.get("rows", []) if item["code"] == row["code"]), None)
+            if line is None:
+                continue
+            key = (row["code"], line["unit"])
+            nets[key] = nets.get(key, 0) + row["quantity"]
+            if kind is None or kind == entry_kind:
+                entries.append({
+                    "code": row["code"],
+                    "name": line["name"],
+                    "unit": line["unit"],
+                    "quantity": row["quantity"],
+                    "reference": reference,
+                    "kind": entry_kind,
+                    "purchase_reference": purchase_reference,
+                    "related_reference": related_reference,
+                    "net_received": nets[key],
+                })
+        return entries
+
     @staticmethod
     def _supplier_snapshot(profile, name):
         # Normalized contact profile used for change snapshots; a missing
